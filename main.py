@@ -29,7 +29,7 @@ app = modal.App(APP_NAME)
 cache_volume = modal.Volume.from_name("nanocpt-cache", create_if_missing=True)
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:13.0.2-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
     .env(
         {
@@ -45,15 +45,19 @@ image = (
         }
     )
     .apt_install("build-essential", "git", "ninja-build")
-    .pip_install("torch>=2.8.0", "packaging", "wheel")
+    .pip_install("torch==2.8.0", "packaging", "wheel")
     .pip_install(
         "accelerate>=1.0.0",
         "bitsandbytes>=0.46.0",
+        "causal-conv1d==1.6.2.post1",
         "datasets>=3.0.0",
+        "flash-attn==2.8.3",
+        "flash-linear-attention==0.5.0",
         "hf_transfer>=0.1.9",
         "huggingface_hub>=0.30.0",
         "numpy>=2.0.0",
         "safetensors>=0.5.0",
+        "tilelang",
         "tqdm>=4.66.0",
         "git+https://github.com/huggingface/transformers.git",
         extra_options="--no-build-isolation",
@@ -88,7 +92,7 @@ def run_track1(
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     optimizer_name: Literal["adamw8bit", "adamw_fused"] = "adamw8bit",
-    attn_implementation: Literal["sdpa", "eager"] = "sdpa",
+    attn_implementation: Literal["flash_attention_2", "sdpa", "eager"] = "flash_attention_2",
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,
@@ -121,8 +125,8 @@ def run_track1(
         raise ValueError("--eval-blocks must be positive")
     if optimizer_name not in {"adamw8bit", "adamw_fused"}:
         raise ValueError("--optimizer-name must be one of: adamw8bit, adamw_fused")
-    if attn_implementation not in {"sdpa", "eager"}:
-        raise ValueError("--attn-implementation must be one of: sdpa, eager")
+    if attn_implementation not in {"flash_attention_2", "sdpa", "eager"}:
+        raise ValueError("--attn-implementation must be one of: flash_attention_2, sdpa, eager")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Modal H100 training path")
 
@@ -471,7 +475,7 @@ def main(
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     optimizer_name: str = "adamw8bit",
-    attn_implementation: str = "sdpa",
+    attn_implementation: str = "flash_attention_2",
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,
