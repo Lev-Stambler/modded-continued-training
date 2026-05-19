@@ -53,8 +53,9 @@ The score is:
 baseline_eval_loss - final_eval_loss
 ```
 
-The timer starts after model load, eval-cache prep, optimizer setup, compile
-warmup, and baseline eval. The final eval runs after the timed train loop.
+The timer starts after model load, eval-cache prep, optimizer setup, an untimed
+train-shaped compile warmup, and baseline eval. The final eval runs after the
+timed train loop.
 
 ## Useful Flags
 

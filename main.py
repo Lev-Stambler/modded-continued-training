@@ -369,23 +369,26 @@ def run_track1(
                         batch.clear()
             ds = dataset_stream(shuffle=True).skip(train_skip_docs)
 
-    if compile_model and compile_warmup:
-        print("running untimed compile warmup", flush=True)
+    batch_iter = train_batches()
+
+    if compile_warmup:
+        print("running untimed train/compile warmup", flush=True)
         model.train()
-        warmup_batch = eval_input_ids[:micro_batch_size].to(device, non_blocking=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            warmup_loss = model(
-                input_ids=warmup_batch,
-                attention_mask=torch.ones_like(warmup_batch, dtype=torch.long),
-                labels=warmup_batch,
-                use_cache=False,
-            ).loss
-        warmup_loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        for _ in range(grad_accum):
+            warmup_batch = next(batch_iter).to(device, non_blocking=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                warmup_loss = model(
+                    input_ids=warmup_batch,
+                    attention_mask=torch.ones_like(warmup_batch, dtype=torch.long),
+                    labels=warmup_batch,
+                    use_cache=False,
+                ).loss / grad_accum
+            warmup_loss.backward()
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
 
     baseline_loss = evaluate("baseline_eval")
-    batch_iter = train_batches()
     train_start = time.monotonic()
     train_deadline = train_start + minutes * 60.0
     optimizer.zero_grad(set_to_none=True)
