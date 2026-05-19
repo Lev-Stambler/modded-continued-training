@@ -28,13 +28,14 @@ DEFAULT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
 app = modal.App(APP_NAME)
 cache_volume = modal.Volume.from_name("nanocpt-cache", create_if_missing=True)
 
-# Qwen3.5 is new enough that the safest path is current Transformers plus the
-# optional fast kernels used by its hybrid full-attention/Gated-DeltaNet stack.
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:13.0.2-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
     .env(
         {
+            "CC": "gcc",
+            "CXX": "g++",
+            "CUDAHOSTCXX": "g++",
             "FLASH_ATTENTION_FORCE_CXX11_ABI": "TRUE",
             "MAX_JOBS": "8",
             "NVCC_THREADS": "2",
@@ -48,10 +49,7 @@ image = (
     .pip_install(
         "accelerate>=1.0.0",
         "bitsandbytes>=0.46.0",
-        "causal-conv1d>=1.5.0",
         "datasets>=3.0.0",
-        "flash-attn>=2.8.0",
-        "flash-linear-attention>=0.2.0",
         "hf_transfer>=0.1.9",
         "huggingface_hub>=0.30.0",
         "numpy>=2.0.0",
@@ -90,7 +88,7 @@ def run_track1(
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     optimizer_name: Literal["adamw8bit", "adamw_fused"] = "adamw8bit",
-    attn_implementation: Literal["flash_attention_2", "sdpa", "eager"] = "flash_attention_2",
+    attn_implementation: Literal["sdpa", "eager"] = "sdpa",
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,
@@ -123,8 +121,8 @@ def run_track1(
         raise ValueError("--eval-blocks must be positive")
     if optimizer_name not in {"adamw8bit", "adamw_fused"}:
         raise ValueError("--optimizer-name must be one of: adamw8bit, adamw_fused")
-    if attn_implementation not in {"flash_attention_2", "sdpa", "eager"}:
-        raise ValueError("--attn-implementation must be one of: flash_attention_2, sdpa, eager")
+    if attn_implementation not in {"sdpa", "eager"}:
+        raise ValueError("--attn-implementation must be one of: sdpa, eager")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Modal H100 training path")
 
@@ -473,7 +471,7 @@ def main(
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     optimizer_name: str = "adamw8bit",
-    attn_implementation: str = "flash_attention_2",
+    attn_implementation: str = "sdpa",
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,

@@ -34,8 +34,7 @@ modal run main.py --minutes 0.1 --eval-blocks 2 --grad-accum 1
 - current Hugging Face Transformers for Qwen3.5 support
 - an NVIDIA CUDA devel base image so source-built CUDA extensions have `nvcc`
 - H100 CUDA build env defaults, including `TORCH_CUDA_ARCH_LIST=9.0`
-- `flash-attn` with `attn_implementation="flash_attention_2"`
-- `flash-linear-attention` and `causal-conv1d` for Qwen3.5 Gated DeltaNet layers
+- PyTorch SDPA attention by default
 - sequence packing from streamed FineMath documents into fixed `seq_len` blocks
 - `torch.compile(..., dynamic=False)` plus an untimed compile warmup
 - `bitsandbytes` `AdamW8bit` by default
@@ -72,10 +71,10 @@ modal run main.py --optimizer-name adamw_fused
 Use `adamw8bit` for the memory-saving default and `adamw_fused` for a simpler
 PyTorch fused AdamW baseline.
 
-Kernel fallback if image build or runtime kernels fail:
+Disable compile for the fastest smoke test:
 
 ```bash
-modal run main.py --attn-implementation sdpa --compile-model false
+modal run main.py --compile-model false
 ```
 
 Save final weights only when needed:
