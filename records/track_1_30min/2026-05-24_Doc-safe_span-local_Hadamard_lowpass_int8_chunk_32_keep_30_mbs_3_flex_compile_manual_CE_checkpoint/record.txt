@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: Doc-safe span-local Hadamard lowpass int8 chunk 32 keep 30 mbs 3 flex compile manual CE checkpoint
+Contributors: 
+Date: 2026-05-24
+Minutes: 30.0
+Eval loss drop: 0.000089
+Baseline eval loss: 1.431487
+Final eval loss: 1.431398
+Steps: 1122
+Tokens: 13,787,136
+Elapsed budget: 1800.6s
+Budget tokens/sec: 7657
+Train-loop elapsed: 1703.4s
+Train-loop tokens/sec: 8094

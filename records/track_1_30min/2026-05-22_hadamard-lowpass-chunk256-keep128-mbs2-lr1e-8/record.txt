@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: hadamard-lowpass-chunk256-keep128-mbs2-lr1e-8
+Contributors: codex
+Date: 2026-05-22
+Minutes: 30.0
+Eval loss drop: 0.000109
+Baseline eval loss: 1.431150
+Final eval loss: 1.431042
+Steps: 1739
+Tokens: 14,245,888
+Elapsed budget: 1800.5s
+Budget tokens/sec: 7912
+Train-loop elapsed: 1800.5s
+Train-loop tokens/sec: 7912

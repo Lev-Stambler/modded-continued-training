@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: Probe doc-safe lowpass int8 keep8 seq8192 mbs2 gradckpt flex compile
+Contributors: 
+Date: 2026-05-25
+Minutes: 5.0
+Eval loss drop: -0.001338
+Baseline eval loss: 1.348136
+Final eval loss: 1.349474
+Steps: 111
+Tokens: 1,818,624
+Elapsed budget: 300.9s
+Budget tokens/sec: 6044
+Train-loop elapsed: 233.1s
+Train-loop tokens/sec: 7801

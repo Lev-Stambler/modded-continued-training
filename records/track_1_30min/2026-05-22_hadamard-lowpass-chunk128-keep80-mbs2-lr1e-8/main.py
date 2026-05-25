@@ -140,14 +140,9 @@ def run_track1(
     micro_batch_size: int = 1,
     grad_accum: int = 8,
     lr: float = 0.0,
-    lr_schedule: Literal["constant", "linear", "cosine"] = "constant",
-    lr_final: float = 0.0,
     weight_decay: float = -1.0,
     warmup_steps: int = 20,
     loss_chunk_size: int = 0,
-    loss_chunk_logits_fp32: bool = True,
-    loss_chunk_manual_ce: bool = False,
-    loss_chunk_checkpoint: bool = False,
     eval_blocks: int = 64,
     seed: int = 1337,
     model_id: str = DEFAULT_MODEL_ID,
@@ -171,7 +166,6 @@ def run_track1(
     activation_filter: Literal["off", "hadamard-lowpass"] = "off",
     activation_filter_scope: Literal["hidden", "token-shaped"] = "hidden",
     activation_filter_kernel: Literal["dense", "fwht"] = "dense",
-    activation_filter_quantization: Literal["none", "int8", "int4"] = "none",
     activation_filter_chunk_size: int = 128,
     activation_filter_keep: int = 64,
     activation_filter_max_suffix_numel: int = 0,
@@ -193,7 +187,6 @@ def run_track1(
     import numpy as np
     import torch
     from datasets import load_dataset
-    from torch.utils.checkpoint import checkpoint as activation_checkpoint
     from transformers import AutoTokenizer
 
     try:
@@ -222,17 +215,8 @@ def run_track1(
         raise ValueError("--warmup-steps must be non-negative")
     if loss_chunk_size < 0:
         raise ValueError("--loss-chunk-size must be non-negative")
-    if loss_chunk_checkpoint and loss_chunk_size == 0:
-        raise ValueError("--loss-chunk-checkpoint requires --loss-chunk-size > 0")
-    if loss_chunk_manual_ce and loss_chunk_size == 0:
-        raise ValueError("--loss-chunk-manual-ce requires --loss-chunk-size > 0")
     if lr < 0:
         raise ValueError("--lr must be non-negative; use 0 for the mode default")
-    lr_schedule = str(lr_schedule).lower()
-    if lr_schedule not in {"constant", "linear", "cosine"}:
-        raise ValueError("--lr-schedule must be one of: constant, linear, cosine")
-    if lr_final < 0:
-        raise ValueError("--lr-final must be non-negative")
     if weight_decay < 0.0 and weight_decay != -1.0:
         raise ValueError("--weight-decay must be >= 0; use -1 for the mode default")
     if tuning_mode not in {"lora", "full"}:
@@ -249,9 +233,6 @@ def run_track1(
     activation_filter_kernel = str(activation_filter_kernel).lower()
     if activation_filter_kernel not in {"dense", "fwht"}:
         raise ValueError("--activation-filter-kernel must be one of: dense, fwht")
-    activation_filter_quantization = str(activation_filter_quantization).lower()
-    if activation_filter_quantization not in {"none", "int8", "int4"}:
-        raise ValueError("--activation-filter-quantization must be one of: none, int8, int4")
     if activation_filter_chunk_size < 1 or activation_filter_chunk_size & (activation_filter_chunk_size - 1):
         raise ValueError("--activation-filter-chunk-size must be a positive power of two")
     if activation_filter_keep < 1 or activation_filter_keep > activation_filter_chunk_size:
@@ -310,18 +291,9 @@ def run_track1(
 
     track_info = TRACKS[track]
     requested_lr = lr
-    requested_lr_final = lr_final
     requested_weight_decay = weight_decay
     requested_optimizer_name = optimizer_name
     lr = lr if lr > 0.0 else (2.0e-4 if tuning_mode == "lora" else 2.0e-5)
-    if lr_schedule == "constant":
-        lr_final = lr
-    else:
-        if requested_lr_final <= 0.0:
-            raise ValueError("--lr-final must be positive when --lr-schedule is linear or cosine")
-        if requested_lr_final > lr:
-            raise ValueError("--lr-final must be <= --lr for linear or cosine decay")
-        lr_final = requested_lr_final
     weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
     resolved_optimizer_name = (
         "adamw_fused"
@@ -377,16 +349,10 @@ def run_track1(
         "effective_tokens_per_step": seq_len * micro_batch_size * grad_accum,
         "lr": lr,
         "requested_lr": requested_lr,
-        "lr_schedule": lr_schedule,
-        "lr_final": lr_final,
-        "requested_lr_final": requested_lr_final,
         "weight_decay": weight_decay,
         "requested_weight_decay": requested_weight_decay,
         "warmup_steps": warmup_steps,
         "loss_chunk_size": loss_chunk_size,
-        "loss_chunk_logits_fp32": loss_chunk_logits_fp32,
-        "loss_chunk_manual_ce": loss_chunk_manual_ce,
-        "loss_chunk_checkpoint": loss_chunk_checkpoint,
         "eval_blocks": eval_blocks,
         "seed": seed,
         "model_id": model_id,
@@ -413,7 +379,6 @@ def run_track1(
         "activation_filter": activation_filter,
         "activation_filter_scope": activation_filter_scope,
         "activation_filter_kernel": activation_filter_kernel,
-        "activation_filter_quantization": activation_filter_quantization,
         "activation_filter_chunk_size": activation_filter_chunk_size,
         "activation_filter_keep": activation_filter_keep,
         "activation_filter_max_suffix_numel": activation_filter_max_suffix_numel,
@@ -762,14 +727,12 @@ def run_track1(
             return base_model.model
         return model
 
-    def forward_chunked_lm_loss(
-        batch: torch.Tensor,
-        attention_mask: torch.Tensor,
-        *,
-        checkpoint_chunks: bool,
-        logits_fp32: bool,
-        manual_ce: bool,
-    ) -> torch.Tensor:
+    def forward_train_loss(batch: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, float]:
+        if loss_chunk_size == 0:
+            output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
+            loss = output.loss
+            return loss, float(loss.detach().cpu())
+
         causal_lm = causal_lm_for_loss()
         transformer = getattr(causal_lm, "model")
         lm_head = getattr(causal_lm, "lm_head")
@@ -777,52 +740,15 @@ def run_track1(
         hidden_states = outputs[0]
         shift_labels = batch[:, 1:].contiguous()
         total_loss = hidden_states.new_zeros((), dtype=torch.float32)
-
-        def chunk_loss_fn(hidden_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
-            logits = lm_head(hidden_chunk)
-            if logits_fp32:
-                logits = logits.float()
-            flat_logits = logits.reshape(-1, logits.shape[-1])
-            flat_labels = labels_chunk.reshape(-1)
-            if manual_ce:
-                target_logits = flat_logits.gather(1, flat_labels.unsqueeze(1)).squeeze(1)
-                losses = torch.logsumexp(flat_logits, dim=-1) - target_logits
-                return losses.sum().float()
-            return torch.nn.functional.cross_entropy(
-                flat_logits,
-                flat_labels,
-                reduction="sum",
-            ).float()
-
         for start in range(0, shift_labels.shape[1], loss_chunk_size):
             end = min(start + loss_chunk_size, shift_labels.shape[1])
-            hidden_chunk = hidden_states[:, start:end, :]
-            labels_chunk = shift_labels[:, start:end]
-            if checkpoint_chunks:
-                chunk_loss = activation_checkpoint(
-                    chunk_loss_fn,
-                    hidden_chunk,
-                    labels_chunk,
-                    use_reentrant=False,
-                )
-            else:
-                chunk_loss = chunk_loss_fn(hidden_chunk, labels_chunk)
-            total_loss = total_loss + chunk_loss
-        return total_loss / shift_labels.numel()
-
-    def forward_train_loss(batch: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, float]:
-        if loss_chunk_size == 0:
-            output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-            loss = output.loss
-            return loss, float(loss.detach().cpu())
-
-        loss = forward_chunked_lm_loss(
-            batch,
-            attention_mask,
-            checkpoint_chunks=loss_chunk_checkpoint,
-            logits_fp32=loss_chunk_logits_fp32,
-            manual_ce=loss_chunk_manual_ce,
-        )
+            logits = lm_head(hidden_states[:, start:end, :]).float()
+            total_loss = total_loss + torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                shift_labels[:, start:end].reshape(-1),
+                reduction="sum",
+            )
+        loss = total_loss / shift_labels.numel()
         return loss, float(loss.detach().cpu())
 
     activation_filter_stats = {
@@ -830,14 +756,8 @@ def run_track1(
         "skipped_tensors": 0,
         "original_saved_bytes": 0,
         "packed_saved_bytes": 0,
-        "doc_spans": 0,
-        "lowpass_chunks": 0,
-        "lowpass_tokens": 0,
-        "exact_remainder_tokens": 0,
-        "exact_remainder_saved_bytes": 0,
     }
     activation_filter_shape_stats: dict[tuple[int, ...], dict[str, int]] = {}
-    activation_filter_current_doc_plans: dict[int, dict[str, Any]] = {}
     activation_filter_order_indices: tuple[int, ...] = ()
     activation_filter_basis_cache: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
     activation_filter_index_cache: dict[tuple[str, int], torch.Tensor] = {}
@@ -861,13 +781,6 @@ def run_track1(
             "activation_filter_skipped_tensors": activation_filter_stats["skipped_tensors"],
             "activation_filter_original_saved_bytes": activation_filter_stats["original_saved_bytes"],
             "activation_filter_packed_saved_bytes": activation_filter_stats["packed_saved_bytes"],
-            "activation_filter_doc_spans": activation_filter_stats["doc_spans"],
-            "activation_filter_lowpass_chunks": activation_filter_stats["lowpass_chunks"],
-            "activation_filter_lowpass_tokens": activation_filter_stats["lowpass_tokens"],
-            "activation_filter_exact_remainder_tokens": activation_filter_stats["exact_remainder_tokens"],
-            "activation_filter_exact_remainder_saved_bytes": activation_filter_stats[
-                "exact_remainder_saved_bytes"
-            ],
         }
 
     def activation_filter_top_shapes(limit: int = 20) -> list[dict[str, Any]]:
@@ -925,55 +838,6 @@ def run_track1(
         activation_filter_index_cache[cache_key] = indices
         return indices
 
-    def set_activation_filter_doc_ids(doc_ids: torch.Tensor) -> None:
-        nonlocal activation_filter_current_doc_plans
-        if activation_filter != "hadamard-lowpass":
-            activation_filter_current_doc_plans = {}
-            return
-        plans: dict[int, dict[str, Any]] = {}
-        doc_ids_cpu = doc_ids.detach().to("cpu")
-        for token_count in (seq_len, seq_len - 1):
-            if token_count > doc_ids_cpu.shape[1]:
-                continue
-            lowpass_indices: list[list[int]] = []
-            exact_indices: list[int] = []
-            doc_spans = 0
-            for row_idx in range(doc_ids_cpu.shape[0]):
-                row_doc_ids = doc_ids_cpu[row_idx, :token_count].tolist()
-                start = 0
-                row_offset = row_idx * token_count
-                while start < token_count:
-                    end = start + 1
-                    doc_id = row_doc_ids[start]
-                    while end < token_count and row_doc_ids[end] == doc_id:
-                        end += 1
-                    doc_spans += 1
-                    span_full_end = start + ((end - start) // activation_filter_chunk_size) * activation_filter_chunk_size
-                    for chunk_start in range(start, span_full_end, activation_filter_chunk_size):
-                        chunk_base = row_offset + chunk_start
-                        lowpass_indices.append(
-                            list(range(chunk_base, chunk_base + activation_filter_chunk_size))
-                        )
-                    exact_indices.extend(row_offset + token_idx for token_idx in range(span_full_end, end))
-                    start = end
-
-            lowpass_tensor = torch.tensor(
-                lowpass_indices,
-                device=doc_ids.device,
-                dtype=torch.long,
-            ).reshape(-1, activation_filter_chunk_size)
-            exact_tensor = torch.tensor(exact_indices, device=doc_ids.device, dtype=torch.long)
-            plans[token_count] = {
-                "lowpass_indices": lowpass_tensor,
-                "exact_indices": exact_tensor,
-                "doc_spans": doc_spans,
-                "lowpass_chunks": int(lowpass_tensor.shape[0]),
-                "lowpass_tokens": int(lowpass_tensor.numel()),
-                "exact_remainder_tokens": int(exact_tensor.numel()),
-                "prefix_count": int(doc_ids_cpu.shape[0]),
-            }
-        activation_filter_current_doc_plans = plans
-
     def normalized_fwht_token_axis(values: torch.Tensor) -> torch.Tensor:
         work = values.clone(memory_format=torch.contiguous_format)
         h = 1
@@ -1008,59 +872,6 @@ def run_track1(
             return normalized_fwht_token_axis(coefficients)
         basis = activation_filter_basis(lowpass.device, lowpass.dtype, keep)
         return torch.matmul(basis.T, lowpass)
-
-    def tensor_nbytes(tensor: torch.Tensor) -> int:
-        return tensor.numel() * tensor.element_size()
-
-    def quantize_lowpass(lowpass: torch.Tensor) -> tuple[Any, int]:
-        if activation_filter_quantization == "none":
-            return lowpass, tensor_nbytes(lowpass)
-
-        qmax = 127 if activation_filter_quantization == "int8" else 7
-        scale = lowpass.abs().amax(dim=1, keepdim=True).clamp_min(torch.finfo(lowpass.dtype).tiny)
-        scale = (scale / qmax).contiguous()
-        quantized = torch.round(lowpass / scale).clamp_(-qmax, qmax).to(torch.int8)
-
-        if activation_filter_quantization == "int8":
-            payload = ("int8", quantized, scale)
-            return payload, tensor_nbytes(quantized) + tensor_nbytes(scale)
-
-        shifted = (quantized + 8).to(torch.uint8)
-        if shifted.shape[1] % 2:
-            pad = torch.zeros(
-                shifted.shape[0],
-                1,
-                shifted.shape[2],
-                device=shifted.device,
-                dtype=shifted.dtype,
-            )
-            shifted = torch.cat((shifted, pad), dim=1)
-        low_nibble = shifted[:, 0::2, :]
-        high_nibble = shifted[:, 1::2, :] << 4
-        packed = (low_nibble | high_nibble).contiguous()
-        payload = ("int4", packed, scale)
-        return payload, tensor_nbytes(packed) + tensor_nbytes(scale)
-
-    def dequantize_lowpass(lowpass: Any, keep: int) -> torch.Tensor:
-        if not isinstance(lowpass, tuple):
-            return lowpass
-        quantization, values, scale = lowpass
-        if quantization == "int8":
-            return values.to(scale.dtype) * scale
-        if quantization != "int4":
-            raise ValueError(f"unknown activation lowpass quantization payload: {quantization}")
-        low_nibble = values & 0x0F
-        high_nibble = values >> 4
-        unpacked = torch.empty(
-            values.shape[0],
-            values.shape[1] * 2,
-            values.shape[2],
-            device=values.device,
-            dtype=torch.int8,
-        )
-        unpacked[:, 0::2, :] = low_nibble.to(torch.int8) - 8
-        unpacked[:, 1::2, :] = high_nibble.to(torch.int8) - 8
-        return unpacked[:, :keep, :].to(scale.dtype) * scale
 
     def activation_token_view(tensor: torch.Tensor) -> tuple[int, torch.Tensor] | None:
         shape = tuple(tensor.shape)
@@ -1112,37 +923,28 @@ def run_track1(
                 activation_filter_stats["skipped_tensors"] += 1
                 return tensor
             keep = activation_filter_keep_for_suffix(suffix_numel)
-            plan = activation_filter_current_doc_plans.get(token_count)
-            prefix_count = math.prod(prefix_shape)
-            if plan is None or plan["prefix_count"] != prefix_count:
-                activation_filter_stats["skipped_tensors"] += 1
-                return tensor
-            lowpass_indices = plan["lowpass_indices"]
-            exact_indices = plan["exact_indices"]
-            if lowpass_indices.numel() == 0:
-                activation_filter_stats["skipped_tensors"] += 1
-                return tensor
-            flattened = view.reshape(prefix_count * token_count, suffix_numel)
-            chunks = flattened[lowpass_indices]
-            lowpass = hadamard_lowpass_encode(chunks, keep).contiguous()
-            lowpass, lowpass_bytes = quantize_lowpass(lowpass)
-            exact = (
-                flattened[exact_indices].contiguous()
-                if exact_indices.numel() > 0
-                else flattened.new_empty((0, suffix_numel))
+            chunk_count = full_tokens // activation_filter_chunk_size
+            full = view.narrow(token_axis, 0, full_tokens).reshape(
+                *prefix_shape,
+                chunk_count,
+                activation_filter_chunk_size,
+                *suffix_shape,
             )
-            exact_bytes = exact.numel() * exact.element_size()
+            full = full.reshape(-1, activation_filter_chunk_size, suffix_numel)
+            lowpass = hadamard_lowpass_encode(full, keep).contiguous()
+            tail = (
+                view.narrow(token_axis, full_tokens, token_count - full_tokens).clone()
+                if full_tokens < token_count
+                else None
+            )
 
         original_bytes = tensor.numel() * tensor.element_size()
-        packed_bytes = lowpass_bytes + exact_bytes
+        packed_bytes = lowpass.numel() * lowpass.element_size()
+        if tail is not None:
+            packed_bytes += tail.numel() * tail.element_size()
         activation_filter_stats["compressed_tensors"] += 1
         activation_filter_stats["original_saved_bytes"] += original_bytes
         activation_filter_stats["packed_saved_bytes"] += packed_bytes
-        activation_filter_stats["doc_spans"] += int(plan["doc_spans"])
-        activation_filter_stats["lowpass_chunks"] += int(plan["lowpass_chunks"])
-        activation_filter_stats["lowpass_tokens"] += int(plan["lowpass_tokens"])
-        activation_filter_stats["exact_remainder_tokens"] += int(plan["exact_remainder_tokens"])
-        activation_filter_stats["exact_remainder_saved_bytes"] += exact_bytes
         shape_stats = activation_filter_shape_stats.setdefault(
             original_shape,
             {"compressed_tensors": 0, "original_saved_bytes": 0, "packed_saved_bytes": 0},
@@ -1153,7 +955,7 @@ def run_track1(
         return (
             "hadamard-lowpass-activation",
             lowpass,
-            exact,
+            tail,
             original_shape,
             view_shape,
             prefix_shape,
@@ -1161,6 +963,7 @@ def run_track1(
             keep,
             token_axis,
             token_count,
+            full_tokens,
         )
 
     def unpack_activation_tensor(packed: Any) -> torch.Tensor:
@@ -1169,7 +972,7 @@ def run_track1(
         (
             _tag,
             lowpass,
-            exact,
+            tail,
             original_shape,
             view_shape,
             prefix_shape,
@@ -1177,26 +980,21 @@ def run_track1(
             keep,
             token_axis,
             token_count,
+            full_tokens,
         ) = packed
         with torch.no_grad(), torch.autocast("cuda", enabled=False):
-            plan = activation_filter_current_doc_plans[token_count]
-            lowpass_indices = plan["lowpass_indices"]
-            exact_indices = plan["exact_indices"]
-            suffix_numel = math.prod(suffix_shape)
-            lowpass = dequantize_lowpass(lowpass, keep)
-            restored = torch.empty(
-                math.prod(prefix_shape) * token_count,
-                suffix_numel,
-                device=lowpass.device,
-                dtype=lowpass.dtype,
+            chunk_count = full_tokens // activation_filter_chunk_size
+            restored = hadamard_lowpass_decode(lowpass, keep).reshape(
+                *prefix_shape,
+                chunk_count,
+                activation_filter_chunk_size,
+                *suffix_shape,
             )
-            restored[lowpass_indices.reshape(-1)] = hadamard_lowpass_decode(lowpass, keep).reshape(
-                -1,
-                suffix_numel,
-            )
-            if exact.numel() > 0:
-                restored[exact_indices] = exact
-            view = restored.reshape(*prefix_shape, token_count, *suffix_shape)
+            restored = restored.reshape(*prefix_shape, full_tokens, *suffix_shape)
+            view = torch.empty(view_shape, device=lowpass.device, dtype=lowpass.dtype)
+            view.narrow(token_axis, 0, full_tokens).copy_(restored)
+            if tail is not None:
+                view.narrow(token_axis, full_tokens, token_count - full_tokens).copy_(tail)
             return view.reshape(original_shape)
 
     def activation_save_context():
@@ -1207,27 +1005,14 @@ def run_track1(
     @torch.no_grad()
     def evaluate(label: str) -> float:
         model.eval()
-        loss_sum = 0.0
-        token_count = 0
+        losses: list[float] = []
         for start in range(0, eval_blocks, micro_batch_size):
             batch = eval_input_ids[start : start + micro_batch_size].to(device, non_blocking=True)
             attention_mask = torch.ones_like(batch, dtype=torch.long)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                if loss_chunk_size == 0:
-                    output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-                    batch_loss = output.loss
-                else:
-                    batch_loss = forward_chunked_lm_loss(
-                        batch,
-                        attention_mask,
-                        checkpoint_chunks=False,
-                        logits_fp32=True,
-                        manual_ce=loss_chunk_manual_ce,
-                    )
-            batch_tokens = batch[:, 1:].numel()
-            loss_sum += float(batch_loss.detach().cpu()) * batch_tokens
-            token_count += batch_tokens
-        loss = loss_sum / token_count
+                output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
+            losses.append(float(output.loss.detach().cpu()))
+        loss = float(np.mean(losses))
         log_metric({"event": label, "eval_loss": loss})
         model.train()
         set_visual_eval(model)
@@ -1236,32 +1021,20 @@ def run_track1(
     def train_batches():
         ds = dataset_stream(shuffle=False).skip(train_skip_docs).shuffle(seed=seed, buffer_size=10_000)
         token_buffer: list[int] = []
-        doc_id_buffer: list[int] = []
         batch: list[torch.Tensor] = []
-        batch_doc_ids: list[torch.Tensor] = []
-        next_doc_id = 1
         while True:
             for row in ds:
                 text = row.get("text")
                 if not isinstance(text, str) or not text.strip():
                     continue
-                ids = tokenize_text(text)
-                if not ids:
-                    continue
-                token_buffer.extend(ids)
-                doc_id_buffer.extend([next_doc_id] * len(ids))
-                next_doc_id += 1
+                token_buffer.extend(tokenize_text(text))
                 while len(token_buffer) >= seq_len:
                     block = torch.tensor(token_buffer[:seq_len], dtype=torch.long)
-                    block_doc_ids = torch.tensor(doc_id_buffer[:seq_len], dtype=torch.long)
                     del token_buffer[:seq_len]
-                    del doc_id_buffer[:seq_len]
                     batch.append(block)
-                    batch_doc_ids.append(block_doc_ids)
                     if len(batch) == micro_batch_size:
-                        yield torch.stack(batch), torch.stack(batch_doc_ids)
+                        yield torch.stack(batch)
                         batch.clear()
-                        batch_doc_ids.clear()
             ds = dataset_stream(shuffle=True).skip(train_skip_docs)
 
     batch_iter = train_batches()
@@ -1281,10 +1054,7 @@ def run_track1(
         model.train()
         optimizer_zero_grad()
         for _ in range(grad_accum):
-            warmup_batch_cpu, warmup_doc_ids_cpu = next(batch_iter)
-            warmup_batch = warmup_batch_cpu.to(device, non_blocking=True)
-            warmup_doc_ids = warmup_doc_ids_cpu.to(device, non_blocking=True)
-            set_activation_filter_doc_ids(warmup_doc_ids)
+            warmup_batch = next(batch_iter).to(device, non_blocking=True)
             attention_mask = torch.ones_like(warmup_batch, dtype=torch.long)
             try:
                 with activation_save_context():
@@ -1346,18 +1116,6 @@ def run_track1(
 
     optimizer_zero_grad()
     train_loop_start = time.monotonic()
-    train_budget_seconds = max(train_deadline - train_loop_start, 1.0e-9)
-
-    def lr_for_step(step_number: int, now: float) -> float:
-        if warmup_steps > 0 and step_number <= warmup_steps:
-            return lr * step_number / warmup_steps
-        if lr_schedule == "constant":
-            return lr
-        progress = min(max((now - train_loop_start) / train_budget_seconds, 0.0), 1.0)
-        if lr_schedule == "linear":
-            return lr + (lr_final - lr) * progress
-        cosine_weight = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return lr_final + (lr - lr_final) * cosine_weight
 
     step = 0
     tokens = 0
@@ -1367,10 +1125,7 @@ def run_track1(
         optimizer_zero_grad()
         accum_losses: list[float] = []
         for _ in range(grad_accum):
-            batch_cpu, doc_ids_cpu = next(batch_iter)
-            batch = batch_cpu.to(device, non_blocking=True)
-            doc_ids = doc_ids_cpu.to(device, non_blocking=True)
-            set_activation_filter_doc_ids(doc_ids)
+            batch = next(batch_iter).to(device, non_blocking=True)
             attention_mask = torch.ones_like(batch, dtype=torch.long)
             try:
                 with activation_save_context():
@@ -1378,7 +1133,6 @@ def run_track1(
                         raw_loss, train_loss_value = forward_train_loss(batch, attention_mask)
                         loss = raw_loss / grad_accum
                 if not math.isfinite(train_loss_value):
-                    event_lr = lr_for_step(step + 1, time.monotonic())
                     stopped_reason = "nonfinite_train_loss"
                     last_loss = train_loss_value
                     log_metric(
@@ -1387,7 +1141,7 @@ def run_track1(
                             "step": step + 1,
                             "train_loss": train_loss_value,
                             "tokens": tokens + int(batch.numel()),
-                            "lr": event_lr,
+                            "lr": lr,
                             "train_peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
                             "train_peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
                             **activation_filter_stats_fields(),
@@ -1397,15 +1151,7 @@ def run_track1(
                 loss.backward()
             except RuntimeError as exc:
                 if is_cuda_oom(exc):
-                    raise_cuda_oom(
-                        "train",
-                        exc,
-                        {
-                            "step": step + 1,
-                            "tokens": tokens,
-                            "lr": lr_for_step(step + 1, time.monotonic()),
-                        },
-                    )
+                    raise_cuda_oom("train", exc, {"step": step + 1, "tokens": tokens})
                 raise
             accum_losses.append(train_loss_value)
             tokens += int(batch.numel())
@@ -1415,7 +1161,7 @@ def run_track1(
             break
 
         step += 1
-        step_lr = lr_for_step(step, time.monotonic())
+        step_lr = lr * step / warmup_steps if warmup_steps > 0 and step <= warmup_steps else lr
         set_optimizer_lr(step_lr)
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer_step()
@@ -1518,14 +1264,9 @@ def main(
     micro_batch_size: int = 1,
     grad_accum: int = 8,
     lr: float = 0.0,
-    lr_schedule: str = "constant",
-    lr_final: float = 0.0,
     weight_decay: float = -1.0,
     warmup_steps: int = 20,
     loss_chunk_size: int = 0,
-    loss_chunk_logits_fp32: bool = True,
-    loss_chunk_manual_ce: bool = False,
-    loss_chunk_checkpoint: bool = False,
     eval_blocks: int = 64,
     seed: int = 1337,
     model_id: str = DEFAULT_MODEL_ID,
@@ -1549,7 +1290,6 @@ def main(
     activation_filter: str = "off",
     activation_filter_scope: str = "hidden",
     activation_filter_kernel: str = "dense",
-    activation_filter_quantization: str = "none",
     activation_filter_chunk_size: int = 128,
     activation_filter_keep: int = 64,
     activation_filter_max_suffix_numel: int = 0,
@@ -1579,14 +1319,9 @@ def main(
         micro_batch_size=micro_batch_size,
         grad_accum=grad_accum,
         lr=lr,
-        lr_schedule=lr_schedule,  # type: ignore[arg-type]
-        lr_final=lr_final,
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
         loss_chunk_size=loss_chunk_size,
-        loss_chunk_logits_fp32=loss_chunk_logits_fp32,
-        loss_chunk_manual_ce=loss_chunk_manual_ce,
-        loss_chunk_checkpoint=loss_chunk_checkpoint,
         eval_blocks=eval_blocks,
         seed=seed,
         model_id=model_id,
@@ -1610,7 +1345,6 @@ def main(
         activation_filter=activation_filter,  # type: ignore[arg-type]
         activation_filter_scope=activation_filter_scope,  # type: ignore[arg-type]
         activation_filter_kernel=activation_filter_kernel,  # type: ignore[arg-type]
-        activation_filter_quantization=activation_filter_quantization,  # type: ignore[arg-type]
         activation_filter_chunk_size=activation_filter_chunk_size,
         activation_filter_keep=activation_filter_keep,
         activation_filter_max_suffix_numel=activation_filter_max_suffix_numel,

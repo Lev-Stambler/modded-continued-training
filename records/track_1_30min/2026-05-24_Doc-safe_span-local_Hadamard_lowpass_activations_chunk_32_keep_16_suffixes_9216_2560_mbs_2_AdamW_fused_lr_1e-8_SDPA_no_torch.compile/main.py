@@ -145,9 +145,6 @@ def run_track1(
     weight_decay: float = -1.0,
     warmup_steps: int = 20,
     loss_chunk_size: int = 0,
-    loss_chunk_logits_fp32: bool = True,
-    loss_chunk_manual_ce: bool = False,
-    loss_chunk_checkpoint: bool = False,
     eval_blocks: int = 64,
     seed: int = 1337,
     model_id: str = DEFAULT_MODEL_ID,
@@ -171,7 +168,6 @@ def run_track1(
     activation_filter: Literal["off", "hadamard-lowpass"] = "off",
     activation_filter_scope: Literal["hidden", "token-shaped"] = "hidden",
     activation_filter_kernel: Literal["dense", "fwht"] = "dense",
-    activation_filter_quantization: Literal["none", "int8", "int4"] = "none",
     activation_filter_chunk_size: int = 128,
     activation_filter_keep: int = 64,
     activation_filter_max_suffix_numel: int = 0,
@@ -193,7 +189,6 @@ def run_track1(
     import numpy as np
     import torch
     from datasets import load_dataset
-    from torch.utils.checkpoint import checkpoint as activation_checkpoint
     from transformers import AutoTokenizer
 
     try:
@@ -222,10 +217,6 @@ def run_track1(
         raise ValueError("--warmup-steps must be non-negative")
     if loss_chunk_size < 0:
         raise ValueError("--loss-chunk-size must be non-negative")
-    if loss_chunk_checkpoint and loss_chunk_size == 0:
-        raise ValueError("--loss-chunk-checkpoint requires --loss-chunk-size > 0")
-    if loss_chunk_manual_ce and loss_chunk_size == 0:
-        raise ValueError("--loss-chunk-manual-ce requires --loss-chunk-size > 0")
     if lr < 0:
         raise ValueError("--lr must be non-negative; use 0 for the mode default")
     lr_schedule = str(lr_schedule).lower()
@@ -249,9 +240,6 @@ def run_track1(
     activation_filter_kernel = str(activation_filter_kernel).lower()
     if activation_filter_kernel not in {"dense", "fwht"}:
         raise ValueError("--activation-filter-kernel must be one of: dense, fwht")
-    activation_filter_quantization = str(activation_filter_quantization).lower()
-    if activation_filter_quantization not in {"none", "int8", "int4"}:
-        raise ValueError("--activation-filter-quantization must be one of: none, int8, int4")
     if activation_filter_chunk_size < 1 or activation_filter_chunk_size & (activation_filter_chunk_size - 1):
         raise ValueError("--activation-filter-chunk-size must be a positive power of two")
     if activation_filter_keep < 1 or activation_filter_keep > activation_filter_chunk_size:
@@ -384,9 +372,6 @@ def run_track1(
         "requested_weight_decay": requested_weight_decay,
         "warmup_steps": warmup_steps,
         "loss_chunk_size": loss_chunk_size,
-        "loss_chunk_logits_fp32": loss_chunk_logits_fp32,
-        "loss_chunk_manual_ce": loss_chunk_manual_ce,
-        "loss_chunk_checkpoint": loss_chunk_checkpoint,
         "eval_blocks": eval_blocks,
         "seed": seed,
         "model_id": model_id,
@@ -413,7 +398,6 @@ def run_track1(
         "activation_filter": activation_filter,
         "activation_filter_scope": activation_filter_scope,
         "activation_filter_kernel": activation_filter_kernel,
-        "activation_filter_quantization": activation_filter_quantization,
         "activation_filter_chunk_size": activation_filter_chunk_size,
         "activation_filter_keep": activation_filter_keep,
         "activation_filter_max_suffix_numel": activation_filter_max_suffix_numel,
@@ -762,14 +746,12 @@ def run_track1(
             return base_model.model
         return model
 
-    def forward_chunked_lm_loss(
-        batch: torch.Tensor,
-        attention_mask: torch.Tensor,
-        *,
-        checkpoint_chunks: bool,
-        logits_fp32: bool,
-        manual_ce: bool,
-    ) -> torch.Tensor:
+    def forward_train_loss(batch: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, float]:
+        if loss_chunk_size == 0:
+            output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
+            loss = output.loss
+            return loss, float(loss.detach().cpu())
+
         causal_lm = causal_lm_for_loss()
         transformer = getattr(causal_lm, "model")
         lm_head = getattr(causal_lm, "lm_head")
@@ -777,52 +759,15 @@ def run_track1(
         hidden_states = outputs[0]
         shift_labels = batch[:, 1:].contiguous()
         total_loss = hidden_states.new_zeros((), dtype=torch.float32)
-
-        def chunk_loss_fn(hidden_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
-            logits = lm_head(hidden_chunk)
-            if logits_fp32:
-                logits = logits.float()
-            flat_logits = logits.reshape(-1, logits.shape[-1])
-            flat_labels = labels_chunk.reshape(-1)
-            if manual_ce:
-                target_logits = flat_logits.gather(1, flat_labels.unsqueeze(1)).squeeze(1)
-                losses = torch.logsumexp(flat_logits, dim=-1) - target_logits
-                return losses.sum().float()
-            return torch.nn.functional.cross_entropy(
-                flat_logits,
-                flat_labels,
-                reduction="sum",
-            ).float()
-
         for start in range(0, shift_labels.shape[1], loss_chunk_size):
             end = min(start + loss_chunk_size, shift_labels.shape[1])
-            hidden_chunk = hidden_states[:, start:end, :]
-            labels_chunk = shift_labels[:, start:end]
-            if checkpoint_chunks:
-                chunk_loss = activation_checkpoint(
-                    chunk_loss_fn,
-                    hidden_chunk,
-                    labels_chunk,
-                    use_reentrant=False,
-                )
-            else:
-                chunk_loss = chunk_loss_fn(hidden_chunk, labels_chunk)
-            total_loss = total_loss + chunk_loss
-        return total_loss / shift_labels.numel()
-
-    def forward_train_loss(batch: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, float]:
-        if loss_chunk_size == 0:
-            output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-            loss = output.loss
-            return loss, float(loss.detach().cpu())
-
-        loss = forward_chunked_lm_loss(
-            batch,
-            attention_mask,
-            checkpoint_chunks=loss_chunk_checkpoint,
-            logits_fp32=loss_chunk_logits_fp32,
-            manual_ce=loss_chunk_manual_ce,
-        )
+            logits = lm_head(hidden_states[:, start:end, :]).float()
+            total_loss = total_loss + torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                shift_labels[:, start:end].reshape(-1),
+                reduction="sum",
+            )
+        loss = total_loss / shift_labels.numel()
         return loss, float(loss.detach().cpu())
 
     activation_filter_stats = {
@@ -1009,59 +954,6 @@ def run_track1(
         basis = activation_filter_basis(lowpass.device, lowpass.dtype, keep)
         return torch.matmul(basis.T, lowpass)
 
-    def tensor_nbytes(tensor: torch.Tensor) -> int:
-        return tensor.numel() * tensor.element_size()
-
-    def quantize_lowpass(lowpass: torch.Tensor) -> tuple[Any, int]:
-        if activation_filter_quantization == "none":
-            return lowpass, tensor_nbytes(lowpass)
-
-        qmax = 127 if activation_filter_quantization == "int8" else 7
-        scale = lowpass.abs().amax(dim=1, keepdim=True).clamp_min(torch.finfo(lowpass.dtype).tiny)
-        scale = (scale / qmax).contiguous()
-        quantized = torch.round(lowpass / scale).clamp_(-qmax, qmax).to(torch.int8)
-
-        if activation_filter_quantization == "int8":
-            payload = ("int8", quantized, scale)
-            return payload, tensor_nbytes(quantized) + tensor_nbytes(scale)
-
-        shifted = (quantized + 8).to(torch.uint8)
-        if shifted.shape[1] % 2:
-            pad = torch.zeros(
-                shifted.shape[0],
-                1,
-                shifted.shape[2],
-                device=shifted.device,
-                dtype=shifted.dtype,
-            )
-            shifted = torch.cat((shifted, pad), dim=1)
-        low_nibble = shifted[:, 0::2, :]
-        high_nibble = shifted[:, 1::2, :] << 4
-        packed = (low_nibble | high_nibble).contiguous()
-        payload = ("int4", packed, scale)
-        return payload, tensor_nbytes(packed) + tensor_nbytes(scale)
-
-    def dequantize_lowpass(lowpass: Any, keep: int) -> torch.Tensor:
-        if not isinstance(lowpass, tuple):
-            return lowpass
-        quantization, values, scale = lowpass
-        if quantization == "int8":
-            return values.to(scale.dtype) * scale
-        if quantization != "int4":
-            raise ValueError(f"unknown activation lowpass quantization payload: {quantization}")
-        low_nibble = values & 0x0F
-        high_nibble = values >> 4
-        unpacked = torch.empty(
-            values.shape[0],
-            values.shape[1] * 2,
-            values.shape[2],
-            device=values.device,
-            dtype=torch.int8,
-        )
-        unpacked[:, 0::2, :] = low_nibble.to(torch.int8) - 8
-        unpacked[:, 1::2, :] = high_nibble.to(torch.int8) - 8
-        return unpacked[:, :keep, :].to(scale.dtype) * scale
-
     def activation_token_view(tensor: torch.Tensor) -> tuple[int, torch.Tensor] | None:
         shape = tuple(tensor.shape)
         if tensor.ndim >= 3 and tensor.shape[1] in {seq_len, seq_len - 1}:
@@ -1125,7 +1017,6 @@ def run_track1(
             flattened = view.reshape(prefix_count * token_count, suffix_numel)
             chunks = flattened[lowpass_indices]
             lowpass = hadamard_lowpass_encode(chunks, keep).contiguous()
-            lowpass, lowpass_bytes = quantize_lowpass(lowpass)
             exact = (
                 flattened[exact_indices].contiguous()
                 if exact_indices.numel() > 0
@@ -1134,7 +1025,7 @@ def run_track1(
             exact_bytes = exact.numel() * exact.element_size()
 
         original_bytes = tensor.numel() * tensor.element_size()
-        packed_bytes = lowpass_bytes + exact_bytes
+        packed_bytes = lowpass.numel() * lowpass.element_size() + exact_bytes
         activation_filter_stats["compressed_tensors"] += 1
         activation_filter_stats["original_saved_bytes"] += original_bytes
         activation_filter_stats["packed_saved_bytes"] += packed_bytes
@@ -1183,7 +1074,6 @@ def run_track1(
             lowpass_indices = plan["lowpass_indices"]
             exact_indices = plan["exact_indices"]
             suffix_numel = math.prod(suffix_shape)
-            lowpass = dequantize_lowpass(lowpass, keep)
             restored = torch.empty(
                 math.prod(prefix_shape) * token_count,
                 suffix_numel,
@@ -1207,27 +1097,14 @@ def run_track1(
     @torch.no_grad()
     def evaluate(label: str) -> float:
         model.eval()
-        loss_sum = 0.0
-        token_count = 0
+        losses: list[float] = []
         for start in range(0, eval_blocks, micro_batch_size):
             batch = eval_input_ids[start : start + micro_batch_size].to(device, non_blocking=True)
             attention_mask = torch.ones_like(batch, dtype=torch.long)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                if loss_chunk_size == 0:
-                    output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-                    batch_loss = output.loss
-                else:
-                    batch_loss = forward_chunked_lm_loss(
-                        batch,
-                        attention_mask,
-                        checkpoint_chunks=False,
-                        logits_fp32=True,
-                        manual_ce=loss_chunk_manual_ce,
-                    )
-            batch_tokens = batch[:, 1:].numel()
-            loss_sum += float(batch_loss.detach().cpu()) * batch_tokens
-            token_count += batch_tokens
-        loss = loss_sum / token_count
+                output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
+            losses.append(float(output.loss.detach().cpu()))
+        loss = float(np.mean(losses))
         log_metric({"event": label, "eval_loss": loss})
         model.train()
         set_visual_eval(model)
@@ -1523,9 +1400,6 @@ def main(
     weight_decay: float = -1.0,
     warmup_steps: int = 20,
     loss_chunk_size: int = 0,
-    loss_chunk_logits_fp32: bool = True,
-    loss_chunk_manual_ce: bool = False,
-    loss_chunk_checkpoint: bool = False,
     eval_blocks: int = 64,
     seed: int = 1337,
     model_id: str = DEFAULT_MODEL_ID,
@@ -1549,7 +1423,6 @@ def main(
     activation_filter: str = "off",
     activation_filter_scope: str = "hidden",
     activation_filter_kernel: str = "dense",
-    activation_filter_quantization: str = "none",
     activation_filter_chunk_size: int = 128,
     activation_filter_keep: int = 64,
     activation_filter_max_suffix_numel: int = 0,
@@ -1584,9 +1457,6 @@ def main(
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
         loss_chunk_size=loss_chunk_size,
-        loss_chunk_logits_fp32=loss_chunk_logits_fp32,
-        loss_chunk_manual_ce=loss_chunk_manual_ce,
-        loss_chunk_checkpoint=loss_chunk_checkpoint,
         eval_blocks=eval_blocks,
         seed=seed,
         model_id=model_id,
@@ -1610,7 +1480,6 @@ def main(
         activation_filter=activation_filter,  # type: ignore[arg-type]
         activation_filter_scope=activation_filter_scope,  # type: ignore[arg-type]
         activation_filter_kernel=activation_filter_kernel,  # type: ignore[arg-type]
-        activation_filter_quantization=activation_filter_quantization,  # type: ignore[arg-type]
         activation_filter_chunk_size=activation_filter_chunk_size,
         activation_filter_keep=activation_filter_keep,
         activation_filter_max_suffix_numel=activation_filter_max_suffix_numel,

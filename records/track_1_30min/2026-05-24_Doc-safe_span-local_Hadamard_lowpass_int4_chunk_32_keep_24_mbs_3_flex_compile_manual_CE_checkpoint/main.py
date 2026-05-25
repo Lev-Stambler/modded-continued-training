@@ -762,14 +762,12 @@ def run_track1(
             return base_model.model
         return model
 
-    def forward_chunked_lm_loss(
-        batch: torch.Tensor,
-        attention_mask: torch.Tensor,
-        *,
-        checkpoint_chunks: bool,
-        logits_fp32: bool,
-        manual_ce: bool,
-    ) -> torch.Tensor:
+    def forward_train_loss(batch: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, float]:
+        if loss_chunk_size == 0:
+            output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
+            loss = output.loss
+            return loss, float(loss.detach().cpu())
+
         causal_lm = causal_lm_for_loss()
         transformer = getattr(causal_lm, "model")
         lm_head = getattr(causal_lm, "lm_head")
@@ -780,11 +778,11 @@ def run_track1(
 
         def chunk_loss_fn(hidden_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
             logits = lm_head(hidden_chunk)
-            if logits_fp32:
+            if loss_chunk_logits_fp32:
                 logits = logits.float()
             flat_logits = logits.reshape(-1, logits.shape[-1])
             flat_labels = labels_chunk.reshape(-1)
-            if manual_ce:
+            if loss_chunk_manual_ce:
                 target_logits = flat_logits.gather(1, flat_labels.unsqueeze(1)).squeeze(1)
                 losses = torch.logsumexp(flat_logits, dim=-1) - target_logits
                 return losses.sum().float()
@@ -798,7 +796,7 @@ def run_track1(
             end = min(start + loss_chunk_size, shift_labels.shape[1])
             hidden_chunk = hidden_states[:, start:end, :]
             labels_chunk = shift_labels[:, start:end]
-            if checkpoint_chunks:
+            if loss_chunk_checkpoint:
                 chunk_loss = activation_checkpoint(
                     chunk_loss_fn,
                     hidden_chunk,
@@ -808,21 +806,7 @@ def run_track1(
             else:
                 chunk_loss = chunk_loss_fn(hidden_chunk, labels_chunk)
             total_loss = total_loss + chunk_loss
-        return total_loss / shift_labels.numel()
-
-    def forward_train_loss(batch: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, float]:
-        if loss_chunk_size == 0:
-            output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-            loss = output.loss
-            return loss, float(loss.detach().cpu())
-
-        loss = forward_chunked_lm_loss(
-            batch,
-            attention_mask,
-            checkpoint_chunks=loss_chunk_checkpoint,
-            logits_fp32=loss_chunk_logits_fp32,
-            manual_ce=loss_chunk_manual_ce,
-        )
+        loss = total_loss / shift_labels.numel()
         return loss, float(loss.detach().cpu())
 
     activation_filter_stats = {
@@ -1207,27 +1191,14 @@ def run_track1(
     @torch.no_grad()
     def evaluate(label: str) -> float:
         model.eval()
-        loss_sum = 0.0
-        token_count = 0
+        losses: list[float] = []
         for start in range(0, eval_blocks, micro_batch_size):
             batch = eval_input_ids[start : start + micro_batch_size].to(device, non_blocking=True)
             attention_mask = torch.ones_like(batch, dtype=torch.long)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                if loss_chunk_size == 0:
-                    output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
-                    batch_loss = output.loss
-                else:
-                    batch_loss = forward_chunked_lm_loss(
-                        batch,
-                        attention_mask,
-                        checkpoint_chunks=False,
-                        logits_fp32=True,
-                        manual_ce=loss_chunk_manual_ce,
-                    )
-            batch_tokens = batch[:, 1:].numel()
-            loss_sum += float(batch_loss.detach().cpu()) * batch_tokens
-            token_count += batch_tokens
-        loss = loss_sum / token_count
+                output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
+            losses.append(float(output.loss.detach().cpu()))
+        loss = float(np.mean(losses))
         log_metric({"event": label, "eval_loss": loss})
         model.train()
         set_visual_eval(model)

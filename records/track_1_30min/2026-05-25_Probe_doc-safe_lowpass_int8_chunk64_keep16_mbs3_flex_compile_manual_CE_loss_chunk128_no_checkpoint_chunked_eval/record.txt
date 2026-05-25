@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: Probe doc-safe lowpass int8 chunk64 keep16 mbs3 flex compile manual CE loss chunk128 no checkpoint chunked eval
+Contributors: 
+Date: 2026-05-25
+Minutes: 5.0
+Eval loss drop: -0.000021
+Baseline eval loss: 1.376126
+Final eval loss: 1.376147
+Steps: 167
+Tokens: 2,052,096
+Elapsed budget: 300.7s
+Budget tokens/sec: 6825
+Train-loop elapsed: 214.9s
+Train-loop tokens/sec: 9548

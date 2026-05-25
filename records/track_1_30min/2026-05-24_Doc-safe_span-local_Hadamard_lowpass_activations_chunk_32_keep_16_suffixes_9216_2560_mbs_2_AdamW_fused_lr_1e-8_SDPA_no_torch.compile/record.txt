@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: Doc-safe span-local Hadamard lowpass activations, chunk 32 keep 16, suffixes 9216/2560, mbs=2, AdamW fused, lr=1e-8, SDPA, no torch.compile
+Contributors: codex
+Date: 2026-05-24
+Minutes: 30.0
+Eval loss drop: 0.000858
+Baseline eval loss: 1.431150
+Final eval loss: 1.430292
+Steps: 2312
+Tokens: 18,939,904
+Elapsed budget: 1800.3s
+Budget tokens/sec: 10520
+Train-loop elapsed: 1800.3s
+Train-loop tokens/sec: 10520
