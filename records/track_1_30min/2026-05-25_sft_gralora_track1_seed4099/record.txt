@@ -1,0 +1,20 @@
+Track 1 (30min)
+Description: sft_gralora_track1_seed4099
+Contributors:
+Date: 2026-05-25
+Data mode: sft
+Loss mask: assistant_only
+Sequence packing: True (stream_concat_no_padding)
+Adapter mode: gralora
+Minutes: 30.0
+Eval loss drop: 0.053016
+Baseline eval loss: 0.125171
+Final eval loss: 0.072155
+Steps: 473
+Tokens: 15,499,264
+Supervised tokens: 762,642
+Eval supervised tokens: 35,073
+Elapsed budget: 1801.1s
+Budget tokens/sec: 8606
+Train-loop elapsed: 1529.7s
+Train-loop tokens/sec: 10133

@@ -19,6 +19,20 @@ case "${1:-}" in
       --attn-implementation sdpa \
       "$@"
     ;;
+  cpt-smoke)
+    shift
+    exec "${cmd[@]}" \
+      --data-mode cpt \
+      --adapter-mode lora \
+      --minutes 0.1 \
+      --eval-blocks 2 \
+      --micro-batch-size 4 \
+      --grad-accum 1 \
+      --no-compile-model \
+      --no-compile-warmup \
+      --attn-implementation sdpa \
+      "$@"
+    ;;
   full-smoke)
     shift
     exec "${cmd[@]}" \
@@ -45,13 +59,17 @@ case "${1:-}" in
     shift
     exec "${cmd[@]}" --track 1 "$@"
     ;;
+  cpt-track1)
+    shift
+    exec "${cmd[@]}" --track 1 --data-mode cpt --adapter-mode lora "$@"
+    ;;
   track2)
     shift
-    exec "${cmd[@]}" --track 2 "$@"
+    exec "${cmd[@]}" --track 2 --data-mode cpt --adapter-mode lora "$@"
     ;;
   track3)
     shift
-    exec "${cmd[@]}" --track 3 "$@"
+    exec "${cmd[@]}" --track 3 --data-mode cpt --adapter-mode lora "$@"
     ;;
   full-track1)
     shift
@@ -59,11 +77,11 @@ case "${1:-}" in
     ;;
   full-track2)
     shift
-    exec "${cmd[@]}" --tuning-mode full --track 2 "$@"
+    exec "${cmd[@]}" --tuning-mode full --track 2 --data-mode cpt "$@"
     ;;
   full-track3)
     shift
-    exec "${cmd[@]}" --tuning-mode full --track 3 "$@"
+    exec "${cmd[@]}" --tuning-mode full --track 3 --data-mode cpt "$@"
     ;;
   *)
     exec "${cmd[@]}" "$@"

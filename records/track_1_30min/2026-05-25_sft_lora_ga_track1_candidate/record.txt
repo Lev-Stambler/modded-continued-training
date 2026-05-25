@@ -1,0 +1,20 @@
+Track 1 (30min)
+Description: sft_lora_ga_track1_candidate
+Contributors:
+Date: 2026-05-25
+Data mode: sft
+Loss mask: assistant_only
+Sequence packing: True (stream_concat_no_padding)
+Adapter mode: lora_ga
+Minutes: 30.0
+Eval loss drop: -0.124002
+Baseline eval loss: 0.125273
+Final eval loss: 0.249274
+Steps: 531
+Tokens: 17,399,808
+Supervised tokens: 854,279
+Eval supervised tokens: 35,073
+Elapsed budget: 1801.5s
+Budget tokens/sec: 9658
+Train-loop elapsed: 1551.1s
+Train-loop tokens/sec: 11217

@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-import uuid
 from pathlib import Path
 from typing import Any, Literal
 
@@ -39,14 +38,11 @@ DEFAULT_LORA_MICRO_BATCH_SIZE = 8
 DEFAULT_FULL_MICRO_BATCH_SIZE = 1
 DEFAULT_EVAL_MICRO_BATCH_SIZE = 2
 DEFAULT_GRALORA_K = 2
-DEFAULT_ADAPTER_MODE = "gralora"
 DEFAULT_LORAPLUS_LR_RATIO = 16.0
 DEFAULT_LORA_EVA_RHO = 2.0
 DEFAULT_MUON_QUANT_BLOCK_SIZE = 2048
 DEFAULT_NORMUON_BETA2 = 0.95
 DEFAULT_NORMUON_EPS = 1.0e-8
-DEFAULT_SEQUENCE_PACKING = True
-DEFAULT_PACKING_STRATEGY = "stream_concat_no_padding"
 
 DATA_MODE_CHOICES = {"sft", "cpt"}
 ADAPTER_MODE_CHOICES = {"lora", "lora_ga", "gralora"}
@@ -241,9 +237,7 @@ def _format_record_text(summary: dict[str, Any]) -> str:
         f"Date: {summary['record_date']}\n"
         f"Data mode: {summary.get('data_mode', 'cpt')}\n"
         f"Loss mask: {summary.get('loss_mask', 'all_tokens')}\n"
-        f"Sequence packing: {summary.get('sequence_packing', DEFAULT_SEQUENCE_PACKING)} "
-        f"({summary.get('packing_strategy', DEFAULT_PACKING_STRATEGY)})\n"
-        f"Adapter mode: {summary.get('adapter_mode', DEFAULT_ADAPTER_MODE)}\n"
+        f"Adapter mode: {summary.get('adapter_mode', 'lora')}\n"
         f"Minutes: {summary['minutes']}\n"
         f"Eval loss drop: {summary['eval_loss_drop']:.6f}\n"
         f"Baseline eval loss: {summary['baseline_eval_loss']:.6f}\n"
@@ -302,9 +296,9 @@ def run_track1(
     dataset_id: str = "",
     dataset_config: str = "",
     dataset_revision: str = "",
-    data_mode: str = "sft",
+    data_mode: Literal["sft", "cpt"] = "sft",
     tuning_mode: Literal["lora", "full"] = "lora",
-    adapter_mode: str = "",
+    adapter_mode: Literal["lora", "lora_ga", "gralora"] = "lora",
     optimizer_name: Literal[
         "auto",
         "adamw8bit",
@@ -400,22 +394,18 @@ def run_track1(
         raise ValueError("--lr must be non-negative; use 0 for the mode default")
     if weight_decay < 0.0 and weight_decay != -1.0:
         raise ValueError("--weight-decay must be >= 0; use -1 for the mode default")
-    if track not in TRACKS:
-        raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
-    data_mode = str(data_mode or ("sft" if track == "1" else "cpt")).lower().replace("-", "_")
+    data_mode = str(data_mode).lower().replace("-", "_")
     if data_mode not in DATA_MODE_CHOICES:
         raise ValueError(f"--data-mode must be one of: {', '.join(sorted(DATA_MODE_CHOICES))}")
-    tuning_mode = str(tuning_mode).lower()
-    if tuning_mode not in {"lora", "full"}:
-        raise ValueError("--tuning-mode must be one of: lora, full")
-    adapter_mode_default = DEFAULT_ADAPTER_MODE if tuning_mode == "lora" and data_mode == "sft" else "lora"
-    adapter_mode = str(adapter_mode or adapter_mode_default).lower().replace("-", "_")
+    adapter_mode = str(adapter_mode).lower().replace("-", "_")
     if adapter_mode in {"loraga", "lora-ga"}:
         adapter_mode = "lora_ga"
     if adapter_mode not in ADAPTER_MODE_CHOICES:
         raise ValueError(
             f"--adapter-mode must be one of: {', '.join(sorted(ADAPTER_MODE_CHOICES))}"
         )
+    if tuning_mode not in {"lora", "full"}:
+        raise ValueError("--tuning-mode must be one of: lora, full")
     gradient_checkpointing = str(gradient_checkpointing).lower()
     if gradient_checkpointing not in {"auto", "true", "false"}:
         raise ValueError("--gradient-checkpointing must be one of: auto, true, false")
@@ -438,8 +428,6 @@ def run_track1(
     if lora_init == "loraga":
         lora_init = "lora_ga"
     if adapter_mode == "lora_ga":
-        if lora_init not in {"default", "lora_ga"}:
-            raise ValueError("--adapter-mode lora_ga cannot be combined with a different --lora-init")
         lora_init = "lora_ga"
     elif adapter_mode == "lora" and lora_init == "lora_ga":
         adapter_mode = "lora_ga"
@@ -506,6 +494,8 @@ def run_track1(
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Modal H100 training path")
+    if track not in TRACKS:
+        raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
     if data_mode == "sft" and track != "1":
         raise ValueError("--data-mode sft is currently implemented only for Track 1")
     if optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit", "lorafa"} and tuning_mode != "lora":
@@ -515,12 +505,6 @@ def run_track1(
         and optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit", "lorafa"}
     ):
         raise ValueError(f"--optimizer-name {optimizer_name} requires standard LoRA adapters")
-    if (
-        tuning_mode == "lora"
-        and adapter_mode == "gralora"
-        and optimizer_name in {"muon", "muon8", "normuon"}
-    ):
-        raise ValueError(f"--optimizer-name {optimizer_name} requires standard LoRA or full tuning")
     if adapter_mode == "gralora" and lora_init != "default":
         raise ValueError("--adapter-mode gralora does not support --lora-init")
     if adapter_mode == "gralora" and lora_use_dora:
@@ -605,7 +589,7 @@ def run_track1(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    run_id = f"{dt.datetime.now(dt.UTC).strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex[:8]}"
+    run_id = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
     run_dir = CACHE_MOUNT / "runs" / run_id
     eval_dir = CACHE_MOUNT / "eval"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -621,8 +605,6 @@ def run_track1(
             "dataset_revision": dataset_revision,
             "data_mode": data_mode,
             "loss_mask": "assistant_only" if data_mode == "sft" else "all_tokens",
-            "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-            "packing_strategy": DEFAULT_PACKING_STRATEGY,
             "seq_len": seq_len,
             "eval_blocks": eval_blocks,
             "seed": seed,
@@ -748,10 +730,6 @@ def run_track1(
         "requested_dataset_revision": requested_dataset_revision,
         "data_mode": data_mode,
         "loss_mask": "assistant_only" if data_mode == "sft" else "all_tokens",
-        "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-        "packing_strategy": DEFAULT_PACKING_STRATEGY,
-        "packed_block_size": seq_len,
-        "padding_tokens_per_block": 0,
         "tuning_mode": tuning_mode,
         "adapter_mode": adapter_mode if tuning_mode == "lora" else None,
         "optimizer_name": resolved_optimizer_name,
@@ -764,8 +742,8 @@ def run_track1(
         "lora_dropout": lora_dropout if tuning_mode == "lora" else None,
         "lora_target_modules": lora_target_modules if tuning_mode == "lora" else None,
         "gralora_k": gralora_k if tuning_mode == "lora" and adapter_mode == "gralora" else None,
-        "lora_use_rslora": lora_use_rslora if tuning_mode == "lora" and adapter_mode != "gralora" else None,
-        "lora_use_dora": lora_use_dora if tuning_mode == "lora" and adapter_mode != "gralora" else None,
+        "lora_use_rslora": lora_use_rslora if tuning_mode == "lora" else None,
+        "lora_use_dora": lora_use_dora if tuning_mode == "lora" else None,
         "lora_init": lora_init if tuning_mode == "lora" and adapter_mode != "gralora" else None,
         "lora_eva_rho": lora_eva_rho if tuning_mode == "lora" and adapter_mode != "gralora" else None,
         "lora_eva_batches": lora_eva_batches if tuning_mode == "lora" and adapter_mode != "gralora" else None,
@@ -925,8 +903,6 @@ def run_track1(
             "dataset_revision": dataset_revision,
             "seq_len": seq_len,
             "eval_blocks": eval_blocks,
-            "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-            "packing_strategy": DEFAULT_PACKING_STRATEGY,
             "seed": seed,
             "kind": "all_token_cpt_packed_v2",
         }
@@ -978,8 +954,6 @@ def run_track1(
             "dataset_revision": dataset_revision,
             "seq_len": seq_len,
             "eval_blocks": eval_blocks,
-            "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-            "packing_strategy": DEFAULT_PACKING_STRATEGY,
             "kind": "chatml_assistant_only_sft_packed_v1",
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
@@ -1204,13 +1178,6 @@ def run_track1(
                     f"(skipped {skipped_small} small, {skipped_divisor} indivisible by k={gralora_k})",
                     flush=True,
                 )
-            elif isinstance(parsed_gralora_target_modules, str):
-                if not re.fullmatch(r"[A-Za-z0-9_.]+", parsed_gralora_target_modules):
-                    raise ValueError(
-                        "--adapter-mode gralora requires --lora-target-modules all-linear "
-                        "or explicit module names"
-                    )
-                parsed_gralora_target_modules = [parsed_gralora_target_modules]
 
             print(
                 "applying GraLoRA "
@@ -2102,9 +2069,9 @@ def main(
     dataset_id: str = "",
     dataset_config: str = "",
     dataset_revision: str = "",
-    data_mode: str = "",
+    data_mode: str = "sft",
     tuning_mode: str = "lora",
-    adapter_mode: str = "",
+    adapter_mode: str = "lora",
     optimizer_name: str = "auto",
     gradient_checkpointing: str = "auto",
     lora_r: int = 32,
@@ -2151,19 +2118,13 @@ def main(
     """Run a nanoFineTune track on Modal.
 
     --track selects the competition track (1=30min, 2=5min, 3=2hr).
-    Track 1 defaults to packed SFT/GraLoRA; Tracks 2/3 default to legacy CPT/LoRA.
     When --minutes is 0 (default), the track's default budget is used.
     Set --record-description to save a competition record on success.
     """
 
-    if track not in TRACKS:
-        raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
-    if not data_mode:
-        data_mode = "sft" if track == "1" else "cpt"
-    if not adapter_mode:
-        adapter_mode = DEFAULT_ADAPTER_MODE if tuning_mode == "lora" and data_mode == "sft" else "lora"
-
     if minutes == 0.0:
+        if track not in TRACKS:
+            raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
         minutes = TRACKS[track]["default_minutes"]
 
     summary = run_track1.remote(

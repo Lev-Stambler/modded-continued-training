@@ -9,9 +9,9 @@ Inspired by [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded
 nanoFineTune measures how far a pretrained language model's heldout eval loss
 can drop during a fixed wall-clock fine-tuning window on a single H100 GPU.
 
-The current default track starts from `Qwen/Qwen3.5-4B-Base`, uses a
-continued-pretraining objective on `HuggingFaceTB/finemath`
-(`finemath-4plus`), and is scored by:
+The current Track 1 default starts from `Qwen/Qwen3.5-4B-Base`, uses packed
+assistant-only tool-calling SFT on `NousResearch/hermes-function-calling-v1`
+(`func_calling_singleturn`), and is scored by:
 
 ```
 score = baseline_eval_loss − final_eval_loss
@@ -22,24 +22,29 @@ optimizer setup, and baseline eval. Compilation, graph capture, autotuning, and
 train-shaped warmup all consume the selected track budget. The final eval runs
 after the timed train loop.
 
-The baseline iteration uses PEFT LoRA by default: all linear language-model
-layers get rank-32 adapters, the base checkpoint stays frozen, and full
-fine-tuning remains available with `--tuning-mode full`.
+The baseline iteration uses PEFT GraLoRA by default: all linear language-model
+layers get rank-32 adapters with `--gralora-k 2`, the base checkpoint stays
+frozen, and full fine-tuning remains available with `--tuning-mode full`. The
+legacy FineMath continued-pretraining objective remains available with
+`--data-mode cpt`.
 
 ## Tracks
 
 | Track | Budget | Default command |
 |-------|--------|-----------------|
 | 1     | 30 min | `./run.sh` |
-| 2     | 5 min  | `./run.sh track2` |
-| 3     | 2 hr   | `./run.sh track3` |
+| 2     | 5 min  | `./run.sh track2` (legacy CPT) |
+| 3     | 2 hr   | `./run.sh track3` (legacy CPT) |
 
 Override the budget explicitly with `--minutes` (default 0 = use track
 default).
 
 ## Rules
 
-New records must:
+The rules below apply to the legacy FineMath CPT record track. Track 1 is under
+active development and currently uses a breaking SFT default.
+
+Legacy CPT records must:
 
 1. **Not modify the model or data source.** The model checkpoint, dataset,
    dataset config, and their pinned revisions are fixed (see Fixed Inputs
@@ -99,8 +104,10 @@ A PR may not be accepted if it:
 | Input | Value | Revision |
 |-------|-------|----------|
 | Model | `Qwen/Qwen3.5-4B-Base` | `1001bb4d826a52d1f399e183466143f4da7b741b` |
-| Dataset | `HuggingFaceTB/finemath` | `e92b25a616738fe95dc186b64dfb19f9c8525594` |
-| Dataset config | `finemath-4plus` | — |
+| Track 1 SFT dataset | `NousResearch/hermes-function-calling-v1` | `dae3e1d28cfbcf4b915c04ea1e072030529b4bda` |
+| Track 1 SFT config | `func_calling_singleturn` | — |
+| Legacy CPT dataset | `HuggingFaceTB/finemath` | `e92b25a616738fe95dc186b64dfb19f9c8525594` |
+| Legacy CPT config | `finemath-4plus` | — |
 
 All are public and ungated.
 
@@ -127,6 +134,36 @@ Short smoke test:
 
 This uses the fastest path: short budget, two eval blocks, SDPA attention, and
 no model compile or compile warmup.
+
+Legacy FineMath CPT smoke test:
+
+```bash
+./run.sh cpt-smoke
+```
+
+Track 1 adapter smokes:
+
+```bash
+./run.sh smoke
+./run.sh smoke --adapter-mode lora
+./run.sh smoke --adapter-mode lora_ga
+```
+
+Full Track 1 SFT runs:
+
+```bash
+./run.sh track1
+./run.sh track1 --adapter-mode lora
+./run.sh track1 --adapter-mode lora_ga
+```
+
+Repeat the current default with fixed seeds:
+
+```bash
+./run.sh track1 --seed 1337
+./run.sh track1 --seed 2027
+./run.sh track1 --seed 4099
+```
 
 Full fine-tune compatibility smoke test:
 
@@ -168,6 +205,14 @@ Run with `--record-description` and `--record-contributors`:
   --record-contributors "@yourhandle"
 ```
 
+For a legacy FineMath CPT record, use the explicit CPT/LoRA path:
+
+```bash
+./run.sh cpt-track1 \
+  --record-description "Legacy CPT LoRA" \
+  --record-contributors "@yourhandle"
+```
+
 This saves a local record folder under `records/track_N_<budget>/` after the
 Modal run returns. The folder contains:
 
@@ -184,9 +229,36 @@ Open a PR with the new record folder. The PR should:
 3. List all contributors.
 4. Update the record history table in this README.
 
-## Record history
+## Track 1 SFT Validation
 
-Current baseline status: the v2 LoRA default keeps
+Track 1 now defaults to packed Hermes tool-calling SFT plus GraLoRA. Full
+30-minute candidate results from 2026-05-25:
+
+| Adapter | Loss drop | Baseline | Final | Steps | Supervised tokens | Log |
+|---|---:|---:|---:|---:|---:|---|
+| `gralora` | `+0.051756` | `0.125171` | `0.073415` | 463 | 747,598 | [summary](records/track_1_30min/2026-05-25_sft_gralora_track1_candidate/summary.json) |
+| `lora` | `+0.013174` | `0.125171` | `0.111997` | 475 | 765,955 | [summary](records/track_1_30min/2026-05-25_sft_lora_track1_candidate/summary.json) |
+| `lora_ga` | `-0.124002` | `0.125273` | `0.249274` | 531 | 854,279 | [summary](records/track_1_30min/2026-05-25_sft_lora_ga_track1_candidate/summary.json) |
+
+GraLoRA full-run repeats. Seeds 2027 and 4099 used the default
+`./run.sh track1` path after GraLoRA became the default; seed 1337 was the
+explicit candidate run from the adapter sweep.
+
+| Seed | Loss drop | Baseline | Final | Steps | Supervised tokens | Log |
+|---:|---:|---:|---:|---:|---:|---|
+| 1337 | `+0.051756` | `0.125171` | `0.073415` | 463 | 747,598 | [summary](records/track_1_30min/2026-05-25_sft_gralora_track1_candidate/summary.json) |
+| 2027 | `+0.049965` | `0.125171` | `0.075206` | 459 | 740,941 | [summary](records/track_1_30min/2026-05-25_sft_gralora_track1_seed2027/summary.json) |
+| 4099 | `+0.053016` | `0.125171` | `0.072155` | 473 | 762,642 | [summary](records/track_1_30min/2026-05-25_sft_gralora_track1_seed4099/summary.json) |
+| mean | `+0.051579` | `0.125171` | `0.073592` | 465 | 750,394 | — |
+
+Conclusion: adopt `--adapter-mode gralora` as the Track 1 default. It produced
+the largest positive eval-loss drop on the shared Hermes SFT eval cache, was
+materially better than standard LoRA and LoRA-GA in the full-run sweep, and
+repeated with a positive drop across all three 30-minute seeds.
+
+## Legacy CPT Record History
+
+Legacy CPT baseline status: the v2 LoRA default keeps
 `compile_mode=max-autotune-no-cudagraphs`. CUDA graphs were tried with
 `max-autotune` and failed during the PEFT LoRA path with a CUDAGraph overwritten
 tensor error, so they are not part of the baseline. The v2 Track 1 run compiled,
@@ -196,7 +268,7 @@ logged baseline/utilization iteration, not a valid competition record under the
 positive-loss-drop rule. The older v1 snapshot predates the scoring cleanup that
 moved compile and warmup inside the timed budget.
 
-### Track 1 — 30 minutes
+### Legacy CPT Track 1 — 30 minutes
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|-----------|-------------|------|-----|--------------|
@@ -239,12 +311,12 @@ Tuning modes:
 LoRA baseline knobs:
 
 ```bash
-./run.sh --lora-r 32 --lora-alpha 64 --lora-target-modules all-linear
-./run.sh --lora-init pissa_niter_4
-./run.sh --lora-init olora
-./run.sh --lora-init eva --lora-eva-batches 16
-./run.sh --lora-init lora_ga --lora-ga-batches 4 --lora-ga-micro-batch-size 1
-./run.sh --lora-use-dora
+./run.sh --adapter-mode lora --lora-r 32 --lora-alpha 64 --lora-target-modules all-linear
+./run.sh --adapter-mode lora --lora-init pissa_niter_4
+./run.sh --adapter-mode lora --lora-init olora
+./run.sh --adapter-mode lora --lora-init eva --lora-eva-batches 16
+./run.sh --adapter-mode lora_ga --lora-ga-batches 4 --lora-ga-micro-batch-size 1
+./run.sh --adapter-mode lora --lora-use-dora
 ./run.sh --gradient-checkpointing true
 ./run.sh --gradient-checkpointing false
 ```
@@ -255,10 +327,12 @@ Optimizer choices:
 ./run.sh --optimizer-name auto
 ./run.sh --optimizer-name adamw8bit
 ./run.sh --optimizer-name adamw_fused
-./run.sh --optimizer-name loraplus_adamw --loraplus-lr-ratio 16
-./run.sh --optimizer-name loraplus_adamw8bit --loraplus-lr-ratio 16
-./run.sh --optimizer-name lorafa --lora-r 128 --lora-alpha 32
+./run.sh --adapter-mode lora --optimizer-name loraplus_adamw --loraplus-lr-ratio 16
+./run.sh --adapter-mode lora --optimizer-name loraplus_adamw8bit --loraplus-lr-ratio 16
+./run.sh --adapter-mode lora --optimizer-name lorafa --lora-r 128 --lora-alpha 32
 ./run.sh --optimizer-name muon --muon-lr-adjustment match_rms_adamw
+./run.sh --optimizer-name muon8 --muon-quant-block-size 2048
+./run.sh --optimizer-name normuon --normuon-beta2 0.95 --normuon-eps 1e-8
 ```
 
 Learning-rate schedule choices:
@@ -311,7 +385,7 @@ Current stable PEFT in the Modal image (`peft==0.19.1`) exposes LoRA-GA via
 `LoraGAConfig` and `preprocess_loraga`, so the trainer now supports:
 
 ```bash
-./run.sh --lora-init lora_ga \
+./run.sh --adapter-mode lora_ga \
   --lora-ga-batches 4 \
   --lora-ga-micro-batch-size 1 \
   --optimizer-name loraplus_adamw --loraplus-lr-ratio 16 --lr 5e-5 \
@@ -370,38 +444,58 @@ for `match_rms_adamw`; the [LoRA+ paper](https://arxiv.org/abs/2402.12354);
 and WSD schedule work ([2410.05192](https://arxiv.org/abs/2410.05192),
 [2601.09000](https://arxiv.org/abs/2601.09000)).
 
-Validation results:
+Full Track 1 results from this pass:
 
 | Run | Scope | Result |
 | --- | --- | --- |
-| `2026-05-22_smoke_LoRA_PiSSA_WSD` | LoRA+ AdamW, PiSSA, WSD, SDPA/no-compile | Passed one train step; peak util 100%, peak NVML 67.48 GiB. |
-| `2026-05-22_smoke_Muon_RMS_PiSSA_WSD` | Muon RMS, PiSSA, WSD, SDPA/no-compile | Passed one train step; peak util 100%, peak NVML 67.34 GiB. |
-| `2026-05-22_compile_smoke_LoRA_flex_WSD` | LoRA+ AdamW, flex attention, `max-autotune-no-cudagraphs` | Compile and warmup passed; 1-minute budget was consumed before train steps. |
 | `2026-05-22_v3_LoRA_PiSSA_WSD` | Full 30-minute Track 1, default LoRA batch, flex compile | 469 steps, 15.37M tokens, 8,529.7 budget tok/s, 10,554.6 train-loop tok/s, peak util 100%, peak NVML 63.70 GiB, eval loss worsened by 0.8602. |
 | `2026-05-22_v4_LoRA_PiSSA_WSD_lr5e-5` | Full 30-minute Track 1, LoRA+ base LR lowered to `5e-5`, flex compile | 498 steps, 16.32M tokens, 9,063.8 budget tok/s, 10,846.9 train-loop tok/s, peak util 100%, peak NVML 66.88 GiB, eval loss worsened by 0.4694. |
-| `2026-05-22_smoke_LoRA-GA_AdamW_WSD_lr5e-5` | LoRA-GA AdamW, WSD, SDPA/no-compile | Passed one train step after expanding `all-linear` to valid LoRA-GA modules; peak util 94%, peak NVML 72.17 GiB, eval loss improved by 0.0056 on the tiny smoke eval. |
 | `2026-05-22_v5_LoRA-GA_AdamW_WSD_lr5e-5` | Full 30-minute Track 1, LoRA-GA AdamW, flex compile, W&B offline | 506 steps, 16.58M tokens, 9,208.7 budget tok/s, 10,927.9 train-loop tok/s, peak util 100%, peak NVML 64.91 GiB, eval loss worsened by 0.0648. |
 
-Conclusion: keep the v2 default (`optimizer_name=auto` -> fused AdamW,
+Conclusion for this legacy CPT pass: keep the v2 default (`optimizer_name=auto` -> fused AdamW,
 `micro_batch_size=8`, flex attention, `max-autotune-no-cudagraphs`). The new
 LoRA+/Muon/PiSSA/WSD and LoRA-GA paths compile and run with good GPU
-utilization, but none beat the default quality baseline yet. LoRA+ ratio 16 is
+utilization, but none beat the legacy default quality baseline yet. LoRA+ ratio 16 is
 not a quality baseline for this task at either `1e-4` or `5e-5`; LoRA-GA is the
 best of this pass but still negative on the 30-minute eval.
+
+### 2026-05-25 Muon quantization pass
+
+The trainer now exposes `muon8`, which keeps Muon's hidden-matrix update but
+stores its momentum state with linear int8 block quantization, and `normuon`,
+which adds NorMuon-style row-wise second-moment normalization after
+orthogonalization. These are experimental optimizer choices; `auto` still
+defaults to fused AdamW for LoRA.
+
+Validation smoke results are kept in this log rather than under `records/`,
+because they are short compatibility checks rather than full Track 1 records.
+
+| Run ID | Optimizer | Scope | Result |
+| --- | --- | --- | --- |
+| `20260525-202122` | `muon8` | 0.1-minute SDPA/no-compile smoke, 2 eval blocks | Passed 1 train step; eval loss `1.771615 -> 1.771327`, drop `+0.000288`; 229.5 budget tok/s; peak NVML 67.27 GiB. |
+| `20260525-202359` | `normuon` | 0.1-minute SDPA/no-compile smoke, 2 eval blocks | Passed 1 train step; eval loss `1.771615 -> 1.771734`, drop `-0.000120`; 208.3 budget tok/s; peak NVML 67.34 GiB. |
 
 Recommended next 30 minute runs:
 
 ```bash
-uv run modal run main.py --minutes 30 --optimizer-name loraplus_adamw \
+uv run modal run main.py --data-mode cpt --adapter-mode lora --minutes 30 --optimizer-name muon8 \
+  --muon-quant-block-size 2048 \
+  --record-description "v6 8-bit Muon lr2e-4"
+
+uv run modal run main.py --data-mode cpt --adapter-mode lora --minutes 30 --optimizer-name normuon \
+  --normuon-beta2 0.95 --normuon-eps 1e-8 \
+  --record-description "v7 NorMuon lr2e-4"
+
+uv run modal run main.py --data-mode cpt --adapter-mode lora --minutes 30 --optimizer-name loraplus_adamw \
   --loraplus-lr-ratio 16 --lr 5e-5 --lora-init pissa_niter_4 \
   --lr-schedule wsd --record-description "v4 LoRA+ PiSSA WSD lr5e-5"
 
-uv run modal run main.py --minutes 30 --optimizer-name muon \
+uv run modal run main.py --data-mode cpt --adapter-mode lora --minutes 30 --optimizer-name muon \
   --muon-lr-adjustment match_rms_adamw --lr 2e-4 --lora-init pissa_niter_4 \
   --lr-schedule wsd --record-description "v4 Muon RMS PiSSA WSD lr2e-4"
 
-uv run modal run main.py --minutes 30 --optimizer-name auto --lr 2e-5 \
-  --lora-init lora_ga --lora-ga-batches 4 --lora-ga-micro-batch-size 1 \
+uv run modal run main.py --data-mode cpt --adapter-mode lora_ga --minutes 30 --optimizer-name auto --lr 2e-5 \
+  --lora-ga-batches 4 --lora-ga-micro-batch-size 1 \
   --lora-ga-cache --lr-schedule wsd \
   --record-description "v6 LoRA-GA AdamW WSD lr2e-5 batches4"
 ```
@@ -420,15 +514,22 @@ Modal image with:
 - Current Hugging Face Transformers for Qwen3.5 support
 - NVIDIA CUDA devel base image so source-built CUDA extensions have `nvcc`
 - H100 CUDA build env defaults, including `TORCH_CUDA_ARCH_LIST=9.0`
-- `attn_implementation="flex_attention"` by default, with `flash-attn` for FA2 fallback
+- `attn_implementation="flex_attention"` by default, with `flash-attn` installed for explicit FA2 runs
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
-- `peft` LoRA support; default mode applies all-linear rank-32 adapters before compile
-  and auto-resolves to `micro_batch_size=8`, `grad_accum=1`, and checkpointing on H100
+- `peft` LoRA/GraLoRA support; default mode applies all-linear rank-32 GraLoRA
+  adapters before compile and auto-resolves to `micro_batch_size=8`,
+  `grad_accum=1`, and checkpointing on H100
+- Track 1 defaults to Hermes single-turn function-calling SFT, rendered as Qwen ChatML
+  with assistant-only labels; `--data-mode cpt` restores packed FineMath all-token labels
+- Adapter selection via `--adapter-mode gralora`, `lora`, or `lora_ga`; LoRA-GA
+  reuses masked SFT batches for its gradient estimate, and GraLoRA defaults to
+  `--gralora-k 2`
 - LoRA variant knobs for rsLoRA, DoRA, PiSSA/OLoRA/EVA/LoRA-GA/orthogonal initialization,
-  LoRA+, and LoRA-FA
+  LoRA+, and LoRA-FA on the standard LoRA adapter path
 - Eval uses a separate auto micro-batch cap of 2 blocks so the default training
   batch does not OOM the full 64-block eval loss/logits path
-- Sequence packing from streamed FineMath documents into fixed `seq_len` blocks
+- No-padding sequence packing from streamed SFT conversations or FineMath
+  documents into fixed `seq_len` blocks (`stream_concat_no_padding`)
 - `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
 - Optional LR scheduling supports constant, full-budget linear/cosine decay,
@@ -440,8 +541,8 @@ Modal image with:
   mirrored into `summary.json` and W&B
 - Optional W&B logging via `--wandb-project`, with `WANDB_API_KEY` forwarded
   from the local environment into the Modal function
-- Optional Muon, with 2D matrix weights on Muon, embeddings/norms/biases/head on
-  `AdamW8bit`, and selectable original or RMS-matched LR scaling
+- Optional Muon variants, with 2D matrix weights on Muon, 8-bit linear blockwise
+  Muon, or NorMuon; embeddings/norms/biases/head stay on `AdamW8bit`
 
 The cheap `./run.sh smoke` path pins SDPA/no-compile smoke tests to
 `micro_batch_size=4`; the larger `micro_batch_size=8` default is intended for
