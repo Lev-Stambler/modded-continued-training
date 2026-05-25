@@ -202,6 +202,7 @@ activation run below.
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|-----------|-------------|------|-----|--------------|
 | v5 | +0.000477 | Full-stack doc-safe Hadamard lowpass (hidden scope, chunk 64, keep 16, int8 retained coeffs, suffixes 9216/2560 only, mbs=3, loss_chunk=128, manual CE, bf16 train logits, no model/loss checkpointing, AdamW fused, lr=1e-8, flex_attention, torch.compile max-autotune-no-cudagraphs); 1331 steps, 16.36M tokens, 9081.4 tok/s | 2026-05-25 | [summary](records/track_1_30min/2026-05-25_Doc-safe_span-local_Hadamard_lowpass_int8_chunk64_keep16_mbs3_flex_compile_manual_CE_loss_chunk128_no_checkpoint_chunked_eval/summary.json) | codex |
+| exp | +0.000461 | Tail-tier doc-safe Hadamard lowpass (hidden scope, primary chunk 128, keep 32, tail tiers 64/32 with ratio-scaled keeps, int8 retained coeffs, suffixes 9216/2560 only, mbs=3, loss_chunk=128, manual CE, bf16 train logits, no model/loss checkpointing, AdamW fused, lr=1e-8, flex_attention, torch.compile max-autotune-no-cudagraphs); 1326 steps, 16.29M tokens, 9047.4 tok/s; reduced peak allocation by 1.67% and exact-tail bytes by 50.5% vs v5 but did not beat v5 score | 2026-05-25 | [summary](records/track_1_30min/2026-05-25_Doc-safe_tail-tier_Hadamard_lowpass_int8_chunk128_keep32_tail32_mbs3_flex_compile_manual_CE_loss_chunk128_no_checkpoint_chunked_eval/summary.json) | codex |
 | v4 | +0.000089 | Comparable full-stack doc-safe Hadamard lowpass (hidden scope, chunk 32, keep 30, int8 retained coeffs, suffixes 9216/2560 only, mbs=3, loss_chunk=256, manual CE checkpoint, bf16 logits, AdamW fused, lr=1e-8, flex_attention, torch.compile max-autotune-no-cudagraphs); 1122 steps, 13.79M tokens, 7657.1 tok/s | 2026-05-24 | [summary](records/track_1_30min/2026-05-24_Doc-safe_span-local_Hadamard_lowpass_int8_chunk_32_keep_30_mbs_3_flex_compile_manual_CE_checkpoint/summary.json) | codex |
 | v3 | +0.000858 | Doc-safe span-local Hadamard lowpass activations (hidden scope, chunk 32, keep 16, suffixes 9216/2560 only, mbs=2, no checkpointing, AdamW fused, lr=1e-8, SDPA, no torch.compile); 2312 steps, 18.94M tokens, 10520.3 tok/s | 2026-05-24 | [summary](records/track_1_30min/2026-05-24_Doc-safe_span-local_Hadamard_lowpass_activations_chunk_32_keep_16_suffixes_9216_2560_mbs_2_AdamW_fused_lr_1e-8_SDPA_no_torch.compile/summary.json) | codex |
 | v2 | +0.000109 | Hadamard lowpass saved activations (hidden scope, chunk 256, keep 128, mbs=2, no checkpointing, AdamW fused, lr=1e-8, SDPA, no compile); 1739 steps, 14.25M tokens, 7912.0 tok/s | 2026-05-22 | [summary](records/track_1_30min/2026-05-22_hadamard-lowpass-chunk256-keep128-mbs2-lr1e-8/summary.json) | codex |
@@ -298,6 +299,18 @@ uv run modal run main.py --minutes 30 --eval-blocks 64 --grad-accum 1 \
   --gradient-checkpointing false --attn-implementation flex_attention \
   --compile-model --compile-warmup \
   --compile-mode max-autotune-no-cudagraphs
+uv run modal run main.py --minutes 30 --eval-blocks 64 --grad-accum 1 \
+  --micro-batch-size 3 --lr 1e-8 --warmup-steps 0 \
+  --loss-chunk-size 128 --no-loss-chunk-logits-fp32 \
+  --loss-chunk-manual-ce \
+  --activation-filter hadamard-lowpass --activation-filter-scope hidden \
+  --activation-filter-kernel dense --activation-filter-quantization int8 \
+  --activation-filter-chunk-size 128 --activation-filter-keep 32 \
+  --activation-filter-tail-min-chunk-size 32 \
+  --activation-filter-suffix-numel 9216,2560 \
+  --gradient-checkpointing false --attn-implementation flex_attention \
+  --compile-model --compile-warmup \
+  --compile-mode max-autotune-no-cudagraphs
 ```
 
 Use `train_peak_cuda_allocated_bytes` as the memory comparison metric; the
@@ -310,6 +323,11 @@ Training packing carries document IDs alongside each token. Hadamard lowpass
 uses span-local chunks: within each contiguous source-document span in the
 packed batch, full chunks are lowpass-compressed and the per-document remainder
 tokens are saved exactly. It never compresses across an EOS/document boundary.
+`activation_filter_tail_min_chunk_size` enables no-cross-document tail tiers.
+For example, chunk 128 / keep 32 with tail min 32 greedily compresses each
+document span as 128-token, then 64-token, then 32-token blocks; keep counts are
+ratio-scaled to 32, 16, and 8 respectively, and only the final sub-32-token tail
+is saved exactly. The default `0` preserves the single-primary-chunk behavior.
 `activation_filter_kernel="dense"` uses a small dense Hadamard projection and is
 currently faster on H100 for these shapes. `activation_filter_kernel="fwht"`
 uses an add/sub fast Walsh-Hadamard transform path, but the current PyTorch
@@ -391,9 +409,17 @@ Smoke peak-memory notes on `seq_len=4096`, `grad_accum=1`, SDPA, no compile:
   chunk 64 / keep 16 preserved the aggressive 25% retained-coefficient ratio,
   stayed doc-safe, fit at ~82.3 GB allocated, and produced the v5 positive full
   record (`+0.000477`) at 16.36M tokens.
+- Tail-tier compression with chunk 128 / keep 32 / tail min 32 fit at
+  ~80.9 GB allocated and cut exact-tail saved bytes by 50.5% versus v5, but the
+  full 30-minute score was slightly lower (`+0.000461`, 16.29M tokens). The
+  comparable 5-minute probe improved tokens by 3.6% over the chunk 64 / keep 16
+  probe and flipped the short-run eval drop positive, but this did not carry to
+  a new full-run record.
 - `micro_batch_size=4` with int4 keep 16 saved activation memory aggressively
-  but OOMed during FLA/Triton backward autotuning, so the current full-stack
-  path stays at `micro_batch_size=3`.
+  but OOMed during FLA/Triton backward autotuning. Tail-tier chunk 128 / keep 32
+  also OOMed at `micro_batch_size=4` under the full flex/compile path with int8
+  and int4 retained coefficients, even with smaller CE chunks, so the current
+  full-stack path stays at `micro_batch_size=3`.
 
 For lowest peak memory, use checkpointing without the filter. For the Hadamard
 experiment's GPU-utilization path, use no-checkpoint larger-batch runs such as:

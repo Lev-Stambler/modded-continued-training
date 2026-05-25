@@ -1171,6 +1171,7 @@ def run_track1(
             if activation_filter_max_suffix_numel > 0 and suffix_numel > activation_filter_max_suffix_numel:
                 activation_filter_stats["skipped_tensors"] += 1
                 return tensor
+            keep = activation_filter_keep_for_suffix(suffix_numel)
             plan = activation_filter_current_doc_plans.get(token_count)
             prefix_count = math.prod(prefix_shape)
             if plan is None or plan["prefix_count"] != prefix_count:

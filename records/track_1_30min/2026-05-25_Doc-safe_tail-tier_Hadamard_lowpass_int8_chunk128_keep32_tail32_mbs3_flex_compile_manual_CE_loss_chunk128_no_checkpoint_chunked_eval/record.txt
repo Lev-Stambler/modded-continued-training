@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: Doc-safe tail-tier Hadamard lowpass int8 chunk128 keep32 tail32 mbs3 flex compile manual CE loss chunk128 no checkpoint chunked eval
+Contributors: codex
+Date: 2026-05-25
+Minutes: 30.0
+Eval loss drop: 0.000461
+Baseline eval loss: 1.431231
+Final eval loss: 1.430770
+Steps: 1326
+Tokens: 16,293,888
+Elapsed budget: 1800.9s
+Budget tokens/sec: 9047
+Train-loop elapsed: 1722.4s
+Train-loop tokens/sec: 9460
