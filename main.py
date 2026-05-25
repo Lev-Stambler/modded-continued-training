@@ -45,7 +45,7 @@ OPTIMIZER_CHOICES = {
     "loraplus_adamw8bit",
     "lorafa",
 }
-LR_SCHEDULE_CHOICES = {"constant", "wsd"}
+LR_SCHEDULE_CHOICES = {"constant", "linear", "cosine", "wsd"}
 MUON_LR_ADJUSTMENT_CHOICES = {"original", "match_rms_adamw"}
 LORA_INIT_CHOICES = {"default", "gaussian", "pissa", "olora", "eva", "orthogonal", "lora_ga"}
 LORA_GA_DIRECTION_CHOICES = {"ArBr", "A2rBr", "ArB2r", "random"}
@@ -220,7 +220,7 @@ def run_track1(
     loraplus_lr_ratio: float = DEFAULT_LORAPLUS_LR_RATIO,
     loraplus_lr_embedding: float = 1.0e-6,
     muon_lr_adjustment: Literal["original", "match_rms_adamw"] = "match_rms_adamw",
-    lr_schedule: Literal["constant", "wsd"] = "constant",
+    lr_schedule: Literal["constant", "linear", "cosine", "wsd"] = "constant",
     lr_decay_fraction: float = 0.1,
     min_lr_ratio: float = 0.0,
     attn_implementation: Literal["flex_attention", "flash_attention_2", "sdpa", "eager"] = "flex_attention",
@@ -1311,9 +1311,21 @@ def run_track1(
     optimizer_zero_grad()
     train_loop_start = time.monotonic()
 
+    full_decay_start_time: float | None = None
+
     def compute_lr_multiplier(step_value: int, now: float) -> float:
+        nonlocal full_decay_start_time
         if warmup_steps > 0 and step_value <= warmup_steps:
             return step_value / warmup_steps
+        if lr_schedule in {"linear", "cosine"}:
+            if full_decay_start_time is None:
+                full_decay_start_time = now
+            decay_seconds = max(train_deadline - full_decay_start_time, 1.0e-9)
+            decay_progress = min(1.0, max(0.0, (now - full_decay_start_time) / decay_seconds))
+            if lr_schedule == "linear":
+                return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - decay_progress)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
         if lr_schedule == "wsd":
             decay_window_seconds = minutes * 60.0 * lr_decay_fraction
             if decay_window_seconds > 0.0:

@@ -265,8 +265,14 @@ Learning-rate schedule choices:
 
 ```bash
 ./run.sh --lr-schedule constant
+./run.sh --lr-schedule linear --min-lr-ratio 0.1
+./run.sh --lr-schedule cosine --min-lr-ratio 0.1
 ./run.sh --lr-schedule wsd --lr-decay-fraction 0.1 --min-lr-ratio 0.0
 ```
+
+`linear` and `cosine` decay from the end of warmup to the track deadline.
+`wsd` keeps the existing warmup/stable/decay behavior and only decays during
+the final `--lr-decay-fraction` of the wall-clock budget.
 
 Attention backends or disable compile:
 
@@ -354,8 +360,8 @@ iteration adds quality-oriented knobs without changing the default baseline:
   pass is worth measuring.
 - LoRA-FA is available for high-rank experiments where activation memory is the
   limiter, e.g. `--optimizer-name lorafa --lora-r 128 --lora-alpha 32`.
-- WSD scheduling is available as an opt-in terminal decay:
-  `--lr-schedule wsd --lr-decay-fraction 0.1`.
+- LR scheduling is available as `constant`, full-budget `linear`/`cosine`, or
+  terminal-decay WSD via `--lr-schedule wsd --lr-decay-fraction 0.1`.
 
 Implementation sources checked: [PEFT's LoRA guide](https://huggingface.co/docs/peft/developer_guides/lora)
 for PiSSA/OLoRA/EVA, DoRA, LoRA+, and LoRA-FA support;
@@ -425,8 +431,8 @@ Modal image with:
 - Sequence packing from streamed FineMath documents into fixed `seq_len` blocks
 - `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
-- Optional WSD LR scheduling keeps the warmup/plateau behavior and decays only
-  near the end of the budget
+- Optional LR scheduling supports constant, full-budget linear/cosine decay,
+  and WSD terminal decay near the end of the budget
 - LoRA `gradient_checkpointing="auto"` enables checkpointing for multi-sample micro-batches
   and still retries the timed warmup with checkpointing if CUDA OOMs
 - GPU telemetry in `metrics.jsonl`, including NVML utilization, power, and CUDA
