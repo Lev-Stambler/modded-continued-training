@@ -968,13 +968,13 @@ def run_track1(
         activation_filter_index_cache[cache_key] = indices
         return indices
 
-    def set_activation_filter_doc_ids(doc_ids: torch.Tensor) -> None:
+    def set_activation_filter_doc_ids(doc_ids: torch.Tensor, index_device: torch.device) -> None:
         nonlocal activation_filter_current_doc_plans
         if activation_filter != "hadamard-lowpass":
             activation_filter_current_doc_plans = {}
             return
         plans: dict[int, dict[str, Any]] = {}
-        doc_ids_cpu = doc_ids.detach().to("cpu")
+        doc_ids_cpu = doc_ids.detach().to("cpu") if doc_ids.device.type != "cpu" else doc_ids.detach()
         for token_count in (seq_len, seq_len - 1):
             if token_count > doc_ids_cpu.shape[1]:
                 continue
@@ -1016,13 +1016,13 @@ def run_track1(
             for chunk_size in activation_filter_lowpass_chunk_sizes:
                 lowpass_tensor = torch.tensor(
                     lowpass_indices_by_chunk_size[chunk_size],
-                    device=doc_ids.device,
+                    device=index_device,
                     dtype=torch.long,
                 ).reshape(-1, chunk_size)
                 lowpass_tiers.append({"chunk_size": chunk_size, "indices": lowpass_tensor})
                 lowpass_chunks += int(lowpass_tensor.shape[0])
                 lowpass_tokens += int(lowpass_tensor.numel())
-            exact_tensor = torch.tensor(exact_indices, device=doc_ids.device, dtype=torch.long)
+            exact_tensor = torch.tensor(exact_indices, device=index_device, dtype=torch.long)
             plans[token_count] = {
                 "lowpass_tiers": lowpass_tiers,
                 "exact_indices": exact_tensor,
@@ -1355,8 +1355,7 @@ def run_track1(
         for _ in range(grad_accum):
             warmup_batch_cpu, warmup_doc_ids_cpu = next(batch_iter)
             warmup_batch = warmup_batch_cpu.to(device, non_blocking=True)
-            warmup_doc_ids = warmup_doc_ids_cpu.to(device, non_blocking=True)
-            set_activation_filter_doc_ids(warmup_doc_ids)
+            set_activation_filter_doc_ids(warmup_doc_ids_cpu, device)
             attention_mask = torch.ones_like(warmup_batch, dtype=torch.long)
             try:
                 with activation_save_context():
@@ -1441,8 +1440,7 @@ def run_track1(
         for _ in range(grad_accum):
             batch_cpu, doc_ids_cpu = next(batch_iter)
             batch = batch_cpu.to(device, non_blocking=True)
-            doc_ids = doc_ids_cpu.to(device, non_blocking=True)
-            set_activation_filter_doc_ids(doc_ids)
+            set_activation_filter_doc_ids(doc_ids_cpu, device)
             attention_mask = torch.ones_like(batch, dtype=torch.long)
             try:
                 with activation_save_context():
