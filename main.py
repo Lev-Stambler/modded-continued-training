@@ -2191,7 +2191,8 @@ def main(
     """Run a modded-continued-training track on Modal.
 
     --track selects the competition track (1=30min, 2=5min, 3=2hr).
-    Track 1 defaults to packed SFT/GraLoRA; Tracks 2/3 default to legacy CPT/LoRA.
+    All tracks default to packed CPT/LoRA on the canonical ConlangCrafter
+    corpus. Pass --data-mode sft for the legacy UltraChat SFT path.
     When --minutes is 0 (default), the track's default budget is used.
     Set --record-description to save a competition record on success.
     """
@@ -2199,7 +2200,7 @@ def main(
     if track not in TRACKS:
         raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
     if not data_mode:
-        data_mode = "sft" if track == "1" else "cpt"
+        data_mode = "cpt"
     if not adapter_mode:
         adapter_mode = DEFAULT_ADAPTER_MODE if tuning_mode == "lora" and data_mode == "sft" else "lora"
 

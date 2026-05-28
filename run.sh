@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Thin wrapper around `uv run modal run main.py`. All entries default to
+# the canonical ConlangCrafter CPT/LoRA challenge — see README for details.
 set -euo pipefail
 
 cmd=(uv run modal run main.py)
@@ -19,19 +21,17 @@ case "${1:-}" in
       --attn-implementation sdpa \
       "$@"
     ;;
-  cpt-smoke)
+  track1)
     shift
-    exec "${cmd[@]}" \
-      --data-mode cpt \
-      --adapter-mode lora \
-      --minutes 0.1 \
-      --eval-blocks 2 \
-      --micro-batch-size 4 \
-      --grad-accum 1 \
-      --no-compile-model \
-      --no-compile-warmup \
-      --attn-implementation sdpa \
-      "$@"
+    exec "${cmd[@]}" --track 1 "$@"
+    ;;
+  track2)
+    shift
+    exec "${cmd[@]}" --track 2 "$@"
+    ;;
+  track3)
+    shift
+    exec "${cmd[@]}" --track 3 "$@"
     ;;
   full-smoke)
     shift
@@ -45,68 +45,22 @@ case "${1:-}" in
       --attn-implementation sdpa \
       "$@"
     ;;
-  full-compile-smoke)
-    shift
-    exec "${cmd[@]}" \
-      --tuning-mode full \
-      --minutes 0.1 \
-      --eval-blocks 2 \
-      --grad-accum 1 \
-      --attn-implementation sdpa \
-      "$@"
-    ;;
-  track1)
-    shift
-    exec "${cmd[@]}" --track 1 "$@"
-    ;;
-  cpt-track1)
-    shift
-    exec "${cmd[@]}" --track 1 --data-mode cpt --adapter-mode lora "$@"
-    ;;
-  track2)
-    shift
-    exec "${cmd[@]}" --track 2 --data-mode cpt --adapter-mode lora "$@"
-    ;;
-  track3)
-    shift
-    exec "${cmd[@]}" --track 3 --data-mode cpt --adapter-mode lora "$@"
-    ;;
   full-track1)
     shift
     exec "${cmd[@]}" --tuning-mode full --track 1 "$@"
     ;;
-  full-track2)
+  # Escape hatches for reproducing pre-conlang records.
+  legacy-cpt-track1)
     shift
-    exec "${cmd[@]}" --tuning-mode full --track 2 --data-mode cpt "$@"
-    ;;
-  full-track3)
-    shift
-    exec "${cmd[@]}" --tuning-mode full --track 3 --data-mode cpt "$@"
-    ;;
-  # ConlangCrafter CPT shortcuts. The CPT default dataset in main.py already
-  # points at TearedModels/conlangcrafter-cpt-bd412d52, so these are mostly
-  # convenience aliases. Override CONLANG_DATASET_ID to use a different
-  # conlang corpus you published yourself.
-  conlang-smoke)
-    shift
-    exec "${cmd[@]}" \
-      --data-mode cpt --adapter-mode lora \
-      ${CONLANG_DATASET_ID:+--dataset-id "$CONLANG_DATASET_ID"} \
-      --minutes 0.1 --eval-blocks 2 --micro-batch-size 4 --grad-accum 1 \
-      --no-compile-model --no-compile-warmup --attn-implementation sdpa \
+    exec "${cmd[@]}" --track 1 \
+      --dataset-id HuggingFaceTB/finemath \
+      --dataset-config finemath-4plus \
+      --dataset-revision e92b25a616738fe95dc186b64dfb19f9c8525594 \
       "$@"
     ;;
-  conlang-track2)
+  legacy-sft-track1)
     shift
-    exec "${cmd[@]}" --track 2 --data-mode cpt --adapter-mode lora \
-      ${CONLANG_DATASET_ID:+--dataset-id "$CONLANG_DATASET_ID"} \
-      "$@"
-    ;;
-  conlang-track1)
-    shift
-    exec "${cmd[@]}" --track 1 --data-mode cpt --adapter-mode lora \
-      ${CONLANG_DATASET_ID:+--dataset-id "$CONLANG_DATASET_ID"} \
-      "$@"
+    exec "${cmd[@]}" --track 1 --data-mode sft "$@"
     ;;
   *)
     exec "${cmd[@]}" "$@"

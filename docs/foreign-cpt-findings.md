@@ -156,15 +156,15 @@ uv run python scripts/synthesize_conlang_cpt.py --target-tokens 10_000_000 --con
 # 3. Publish to HF.
 uv run python scripts/push_conlang_dataset.py data/conlang_cpt/<language_id>
 
-# 4. Use as the CPT default (no env var needed — main.py defaults
-#    to TearedModels/conlangcrafter-cpt-bd412d52). Override with
-#    `export CONLANG_DATASET_ID=...` to point at your own corpus.
+# 4. Train (main.py defaults to TearedModels/conlangcrafter-cpt-bd412d52,
+#    so the canonical commands "just work"). Override --dataset-id to
+#    use your own corpus.
 ./run.sh track2                  # 5-min sprint
-./run.sh cpt-track1              # 30-min Track 1
+./run.sh track1                  # 30-min Track 1
 
-./run.sh conlang-track1 --seed 1337 --record-description "ConlangCrafter CPT seed1337" --record-contributors "@you"
-./run.sh conlang-track1 --seed 2027 --record-description "ConlangCrafter CPT seed2027" --record-contributors "@you"
-./run.sh conlang-track1 --seed 4099 --record-description "ConlangCrafter CPT seed4099" --record-contributors "@you"
+./run.sh track1 --seed 1337 --record-description "ConlangCrafter CPT seed1337" --record-contributors "@you"
+./run.sh track1 --seed 2027 --record-description "ConlangCrafter CPT seed2027" --record-contributors "@you"
+./run.sh track1 --seed 4099 --record-description "ConlangCrafter CPT seed4099" --record-contributors "@you"
 ```
 
 ## References
