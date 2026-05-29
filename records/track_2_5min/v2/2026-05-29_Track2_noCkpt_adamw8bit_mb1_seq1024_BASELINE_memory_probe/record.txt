@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 noCkpt adamw8bit mb1 seq1024 BASELINE memory probe
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.868755
+Baseline eval loss: 1.303133
+Final eval loss: 0.434377
+Steps: 195
+Tokens: 1,597,440
+Supervised tokens: 1,595,880
+Eval supervised tokens: 262,144
+Compile + warmup (untimed): 216.1s
+Elapsed budget: 300.2s
+Budget tokens/sec: 5321
+Train-loop elapsed: 300.2s
+Train-loop tokens/sec: 5321
