@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 v2 adamw8bit lp wholeSeq r8 mlp seq1024 mb4 noCkpt exactGradX seed1337
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.169037
+Baseline eval loss: 1.234921
+Final eval loss: 1.065884
+Steps: 277
+Tokens: 2,269,184
+Supervised tokens: 2,248,938
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 0.0s
+Elapsed budget: 300.5s
+Budget tokens/sec: 7553
+Train-loop elapsed: 300.5s
+Train-loop tokens/sec: 7553

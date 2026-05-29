@@ -50,7 +50,8 @@ DEFAULT_NORMUON_EPS = 1.0e-8
 DEFAULT_SEQUENCE_PACKING = True
 DEFAULT_PACKING_STRATEGY = "stream_concat_no_padding"
 DEFAULT_CPT_TEXT_FIELD = "text"
-DEFAULT_LOWPASS_KEEP = 8
+DEFAULT_LOWPASS_CHUNK_SIZE = 64
+DEFAULT_LOWPASS_KEEP = 32
 DEFAULT_LOWPASS_TARGET_FILTER = "mlp"
 LOWPASS_TARGET_FILTER_CHOICES = {"mlp", "all", "none"}
 # Eval-correctness version. Bump when a change alters absolute eval-loss
@@ -238,7 +239,7 @@ image = (
         "git+https://github.com/huggingface/transformers.git",
         extra_options="--no-build-isolation",
     )
-    .add_local_python_source("lowpass")
+    .add_local_python_source("lowpass", "lowpass_triton")
 )
 
 
@@ -341,11 +342,13 @@ def run_track1(
     muon_lr: float = 0.0,
     adamw_tail_lr: float = 0.0,
     lowpass: bool = False,
-    lowpass_projector_kind: Literal["dct", "hadamard", "haar"] = "dct",
+    lowpass_projector_kind: Literal["hadamard", "dct", "haar"] = "hadamard",
+    lowpass_chunk_size: int = DEFAULT_LOWPASS_CHUNK_SIZE,
     lowpass_keep: int = DEFAULT_LOWPASS_KEEP,
     lowpass_target_filter: Literal["mlp", "all", "none"] = DEFAULT_LOWPASS_TARGET_FILTER,
     lowpass_min_hidden_dim: int = 8000,
     lowpass_max_hidden_dim: int = 16000,
+    lowpass_hadamard_backend: Literal["auto", "piecewise", "dense"] = "auto",
     lr_schedule: Literal["constant", "linear", "cosine", "wsd"] = "constant",
     lr_decay_fraction: float = 0.1,
     min_lr_ratio: float = 0.0,
@@ -440,8 +443,10 @@ def run_track1(
         raise ValueError(
             f"--lowpass-target-filter must be one of: {', '.join(sorted(LOWPASS_TARGET_FILTER_CHOICES))}"
         )
-    if lowpass_keep < 1:
-        raise ValueError("--lowpass-keep must be positive")
+    if lowpass_chunk_size < 1:
+        raise ValueError("--lowpass-chunk-size must be positive")
+    if lowpass_keep < 1 or lowpass_keep > lowpass_chunk_size:
+        raise ValueError("--lowpass-keep must be in [1, --lowpass-chunk-size]")
     lr_schedule = str(lr_schedule).lower()
     if lr_schedule not in LR_SCHEDULE_CHOICES:
         raise ValueError(f"--lr-schedule must be one of: {', '.join(sorted(LR_SCHEDULE_CHOICES))}")
@@ -493,9 +498,7 @@ def run_track1(
     weight_decay = weight_decay if weight_decay >= 0.0 else 0.1
     checkpointing_enabled = gradient_checkpointing != "false"
     gradient_checkpointing_fallback_used = False
-    # Whole-seq lowpass projects across the entire sequence (does not chunk),
-    # so document-boundary padding is unnecessary.
-    pack_align = 1
+    pack_align = int(lowpass_chunk_size) if lowpass else 1
 
     os.environ.setdefault("HF_HOME", str(HF_CACHE))
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -653,9 +656,11 @@ def run_track1(
         "requested_adamw_tail_lr": requested_adamw_tail_lr,
         "lowpass": bool(lowpass),
         "lowpass_projector_kind": lowpass_projector_kind,
+        "lowpass_chunk_size": lowpass_chunk_size,
         "lowpass_keep": lowpass_keep,
         "lowpass_min_hidden_dim": lowpass_min_hidden_dim,
         "lowpass_max_hidden_dim": lowpass_max_hidden_dim,
+        "lowpass_hadamard_backend": lowpass_hadamard_backend,
         "eval_version": EVAL_VERSION,
         "pack_align": pack_align,
         "lr_schedule": lr_schedule,
@@ -1084,24 +1089,43 @@ def run_track1(
     log_gpu("after_model_to_cuda")
 
     if lowpass:
-        from lowpass import LowpassConfig, make_module_filter, replace_linear_with_lowpass
+        from lowpass import (
+            LowpassConfig,
+            activation_save_context,
+            make_module_filter,
+            replace_linear_with_lowpass,
+        )
 
         lowpass_config = LowpassConfig(
             projector_kind=lowpass_projector_kind,
+            chunk_size=lowpass_chunk_size,
             keep=lowpass_keep,
             min_hidden_dim=lowpass_min_hidden_dim,
             max_hidden_dim=lowpass_max_hidden_dim,
+            hadamard_backend=lowpass_hadamard_backend,
         )
+        # Per-Linear patching catches every nn.Linear's input (including the
+        # MLP intermediate via down_proj's input — the biggest activation in
+        # the model). This is the path that actually frees memory at full FT
+        # because the global `saved_tensors_hooks` misses fused MLP kernels.
         filter_fn = make_module_filter(lowpass_target_filter)
         replaced = replace_linear_with_lowpass(model, lowpass_config, filter_fn)
         print(
             f"lowpass: replaced {len(replaced)} nn.Linear modules "
-            f"(target={lowpass_target_filter}, keep={lowpass_keep}, "
+            f"(target={lowpass_target_filter}, chunk={lowpass_chunk_size}, keep={lowpass_keep}, "
             f"hidden_dim∈[{lowpass_min_hidden_dim}, "
             f"{lowpass_max_hidden_dim if lowpass_max_hidden_dim > 0 else '∞'}], "
-            f"projector={lowpass_projector_kind})",
+            f"projector={lowpass_projector_kind}, backend={lowpass_hadamard_backend})",
             flush=True,
         )
+    else:
+        lowpass_config = None
+
+    def lowpass_context():
+        if lowpass_config is None:
+            import contextlib
+            return contextlib.nullcontext()
+        return activation_save_context(lowpass_config, seq_len)
 
     named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     trainable_params = [p for _, p in named_trainable_params]
@@ -1550,26 +1574,27 @@ def run_track1(
         optimizer_zero_grad()
         warmup_losses: list[torch.Tensor] = []
         warmup_supervised_counts: list[int] = []
-        for _ in range(grad_accum):
-            warmup_batch = next(batch_iter)
-            input_ids = warmup_batch["input_ids"].to(device, non_blocking=True)
-            labels = warmup_batch["labels"].to(device, non_blocking=True)
-            position_ids = warmup_batch["position_ids"].to(device, non_blocking=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                warmup_loss = model(
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    position_ids=position_ids,
-                    labels=labels,
-                    use_cache=False,
-                ).loss
-            warmup_losses.append(warmup_loss)
-            warmup_supervised_counts.append(_supervised_token_count(labels.detach().cpu()))
-        warmup_supervised_total = sum(warmup_supervised_counts)
-        if warmup_supervised_total <= 0:
-            raise RuntimeError("warmup batch had no supervised tokens")
-        for warmup_loss, supervised in zip(warmup_losses, warmup_supervised_counts):
-            (warmup_loss * (supervised / warmup_supervised_total)).backward()
+        with lowpass_context():
+            for _ in range(grad_accum):
+                warmup_batch = next(batch_iter)
+                input_ids = warmup_batch["input_ids"].to(device, non_blocking=True)
+                labels = warmup_batch["labels"].to(device, non_blocking=True)
+                position_ids = warmup_batch["position_ids"].to(device, non_blocking=True)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    warmup_loss = model(
+                        input_ids=input_ids,
+                        attention_mask=None,
+                        position_ids=position_ids,
+                        labels=labels,
+                        use_cache=False,
+                    ).loss
+                warmup_losses.append(warmup_loss)
+                warmup_supervised_counts.append(_supervised_token_count(labels.detach().cpu()))
+            warmup_supervised_total = sum(warmup_supervised_counts)
+            if warmup_supervised_total <= 0:
+                raise RuntimeError("warmup batch had no supervised tokens")
+            for warmup_loss, supervised in zip(warmup_losses, warmup_supervised_counts):
+                (warmup_loss * (supervised / warmup_supervised_total)).backward()
         optimizer_zero_grad()
         torch.cuda.synchronize()
 
@@ -1662,31 +1687,32 @@ def run_track1(
         accum_losses: list[float] = []
         accum_supervised_tokens = 0
         accum_loss_tensors: list[tuple[torch.Tensor, int]] = []
-        for _ in range(grad_accum):
-            batch = next(batch_iter)
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
-            position_ids = batch["position_ids"].to(device, non_blocking=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output = model(
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    position_ids=position_ids,
-                    labels=labels,
-                    use_cache=False,
-                )
-            accum_losses.append(float(output.loss.detach().cpu()))
-            tokens += int(input_ids.numel())
-            batch_supervised = _supervised_token_count(labels.detach().cpu())
-            if batch_supervised <= 0:
-                raise RuntimeError("training batch had no supervised tokens")
-            accum_supervised_tokens += batch_supervised
-            supervised_tokens_seen += batch_supervised
-            accum_loss_tensors.append((output.loss, batch_supervised))
+        with lowpass_context():
+            for _ in range(grad_accum):
+                batch = next(batch_iter)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
+                position_ids = batch["position_ids"].to(device, non_blocking=True)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    output = model(
+                        input_ids=input_ids,
+                        attention_mask=None,
+                        position_ids=position_ids,
+                        labels=labels,
+                        use_cache=False,
+                    )
+                accum_losses.append(float(output.loss.detach().cpu()))
+                tokens += int(input_ids.numel())
+                batch_supervised = _supervised_token_count(labels.detach().cpu())
+                if batch_supervised <= 0:
+                    raise RuntimeError("training batch had no supervised tokens")
+                accum_supervised_tokens += batch_supervised
+                supervised_tokens_seen += batch_supervised
+                accum_loss_tensors.append((output.loss, batch_supervised))
 
-        for loss_tensor, batch_supervised in accum_loss_tensors:
-            loss = loss_tensor * (batch_supervised / accum_supervised_tokens)
-            loss.backward()
+            for loss_tensor, batch_supervised in accum_loss_tensors:
+                loss = loss_tensor * (batch_supervised / accum_supervised_tokens)
+                loss.backward()
 
         step += 1
         lr_now = time.monotonic()
@@ -1817,11 +1843,13 @@ def main(
     muon_lr: float = 0.0,
     adamw_tail_lr: float = 0.0,
     lowpass: bool = False,
-    lowpass_projector_kind: str = "dct",
+    lowpass_projector_kind: str = "hadamard",
+    lowpass_chunk_size: int = DEFAULT_LOWPASS_CHUNK_SIZE,
     lowpass_keep: int = DEFAULT_LOWPASS_KEEP,
     lowpass_target_filter: str = DEFAULT_LOWPASS_TARGET_FILTER,
     lowpass_min_hidden_dim: int = 8000,
     lowpass_max_hidden_dim: int = 16000,
+    lowpass_hadamard_backend: str = "auto",
     lr_schedule: str = "constant",
     lr_decay_fraction: float = 0.1,
     min_lr_ratio: float = 0.0,
@@ -1886,10 +1914,12 @@ def main(
         adamw_tail_lr=adamw_tail_lr,
         lowpass=lowpass,
         lowpass_projector_kind=lowpass_projector_kind,  # type: ignore[arg-type]
+        lowpass_chunk_size=lowpass_chunk_size,
         lowpass_keep=lowpass_keep,
         lowpass_target_filter=lowpass_target_filter,  # type: ignore[arg-type]
         lowpass_min_hidden_dim=lowpass_min_hidden_dim,
         lowpass_max_hidden_dim=lowpass_max_hidden_dim,
+        lowpass_hadamard_backend=lowpass_hadamard_backend,  # type: ignore[arg-type]
         lr_schedule=lr_schedule,  # type: ignore[arg-type]
         lr_decay_fraction=lr_decay_fraction,
         min_lr_ratio=min_lr_ratio,

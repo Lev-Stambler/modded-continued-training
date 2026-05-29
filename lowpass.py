@@ -1,92 +1,58 @@
-"""Hadamard low-pass activation compression via `saved_tensors_hooks`.
+"""Whole-sequence low-pass activation compression for `nn.Linear`.
 
-Adapted from the `nanoCPT-hadamard-lowpass` worktree, simplified for our
-full-fine-tune trainer. The approach:
+Ported from `/home/lev/hermes-home/Research/AdaptiveRoundingSimp-qad-clean`'s
+`instant.py` reference design. Each wrapped `nn.Linear` saves a
+sequence-axis-projected `x_hat = projector @ x` for backward (shape
+`[..., keep, hidden]` instead of `[..., seq, hidden]`), giving
+seq_len/keep× memory savings on the saved activation.
 
-- Install a model-wide `torch.autograd.graph.saved_tensors_hooks(pack,
-  unpack)` context around the training step. Every `save_for_backward`
-  call across the model (attention, MLP, anywhere) is intercepted.
-- `pack(tensor)`: if the tensor looks like a hidden-state activation
-  with a sequence axis, Hadamard-project chunks of `chunk_size` tokens
-  along that axis and keep only the top-`keep` low-frequency
-  coefficients (50 % compression at keep=32, chunk=64). Returns a tuple
-  the autograd engine stores instead of the raw tensor.
-- `unpack(packed)`: inverse-Hadamard reconstructs an approximation of
-  the original tensor when backward needs it.
+Backward:
+- `grad_x = grad_output @ weight` is **exact** (projecting it hurt
+  convergence in the AdaptiveRoundingSimp experiments).
+- `grad_w = einsum("nro,nri->oi", go_hat, x_hat)` is computed in the
+  projected space using `go_hat = projector @ grad_output`. This is a
+  low-rank approximation, accurate when the activation and grad signals
+  along the sequence axis lie close to the projector's row space.
 
-Why this beats per-Linear wrapping:
-- No custom `torch.autograd.Function` → no dynamo graph break per
-  Linear (the previous design added 144 graph breaks per forward).
-- One context manager wraps every save across the model — including
-  attention K/V, MLP intermediates, anything that gets saved — without
-  having to enumerate or rewrite modules.
-- Lives entirely at the autograd-engine level, outside the compiled
-  forward/backward graph. `torch.compile` traces normal code; autograd
-  calls our pack/unpack on the side.
-
-When combined with `--gradient-checkpointing false`, the compressed
-activations actually replace what's held across the forward/backward
-boundary — that's where the throughput win comes from (no recompute,
-fits in memory thanks to compression).
+Supported projectors: `dct`, `hadamard`, `haar` (the latter two require
+a power-of-two sequence length).
 """
 
 from __future__ import annotations
 
-import contextlib
 import math
-import os
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 
-_TRITON_PIECEWISE_PROJECT: Callable[[Tensor, Tensor], Tensor] | None = None
-_TRITON_PIECEWISE_PROJECT_IMPORT_ERROR: Exception | None = None
 _PROJECTOR_CACHE: dict[tuple[str, int, int, str, int, str], Tensor] = {}
 
 
 @dataclass(frozen=True)
 class LowpassConfig:
-    projector_kind: str = "hadamard"
-    chunk_size: int = 64
-    keep: int = 32
-    min_hidden_dim: int = 64
-    max_hidden_dim: int = 0  # 0 means no upper bound
-    hadamard_backend: str = "auto"
+    projector_kind: str = "dct"
+    keep: int = 8
+    min_hidden_dim: int = 8000
+    max_hidden_dim: int = 16000
     enabled: bool = True
 
     def __post_init__(self) -> None:
         projector_kind = str(self.projector_kind).lower()
-        hadamard_backend = str(self.hadamard_backend).lower().replace("_", "-")
-        if hadamard_backend in {"fast", "triton"}:
-            hadamard_backend = "piecewise"
         object.__setattr__(self, "projector_kind", projector_kind)
-        object.__setattr__(self, "hadamard_backend", hadamard_backend)
-        if projector_kind not in {"hadamard", "dct", "haar"}:
+        if projector_kind not in {"dct", "hadamard", "haar"}:
             raise ValueError(f"unknown projector_kind {self.projector_kind!r}")
-        if hadamard_backend not in {"auto", "piecewise", "dense"}:
-            raise ValueError(f"unknown hadamard_backend {self.hadamard_backend!r}")
-        if self.chunk_size < 1:
-            raise ValueError("chunk_size must be positive")
-        if self.keep < 1 or self.keep > self.chunk_size:
-            raise ValueError("keep must be in [1, chunk_size]")
+        if self.keep < 1:
+            raise ValueError("keep must be >= 1")
         if self.min_hidden_dim < 0:
             raise ValueError("min_hidden_dim must be non-negative")
-        if projector_kind in {"hadamard", "haar"} and not _is_power_of_two(self.chunk_size):
-            raise ValueError(f"{projector_kind} requires power-of-two chunk_size")
 
 
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
-
-
-def _next_power_of_two(value: int) -> int:
-    if value <= 1:
-        return 1
-    return 1 << (int(value) - 1).bit_length()
 
 
 def _bit_reverse(value: int, width: int) -> int:
@@ -188,262 +154,40 @@ def _fixed_projector(kind: str, seq_len: int, rank: int, device: torch.device, d
     return projector
 
 
-def _piecewise_segment_count(kind: str, seq_len: int, rank: int) -> int | None:
-    rank = min(max(int(rank), 0), int(seq_len))
-    if kind not in {"hadamard", "haar"} or rank <= 0:
-        return None
-    if not _is_power_of_two(seq_len):
-        return None
-    segment_count = min(_next_power_of_two(rank), seq_len)
-    if seq_len % segment_count != 0:
-        return None
-    return segment_count
-
-
-def _piecewise_projector_coefficients(
-    kind: str,
-    seq_len: int,
-    rank: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[Tensor, int] | None:
-    segment_count = _piecewise_segment_count(kind, seq_len, rank)
-    if segment_count is None:
-        return None
-    segment_len = seq_len // segment_count
-    projector = _fixed_projector(kind, seq_len, rank, device, dtype)
-    coefficients = projector[:, ::segment_len].contiguous()
-    return coefficients, segment_len
-
-
-def _load_triton_piecewise_project() -> Callable[[Tensor, Tensor], Tensor]:
-    global _TRITON_PIECEWISE_PROJECT_IMPORT_ERROR, _TRITON_PIECEWISE_PROJECT
-    if _TRITON_PIECEWISE_PROJECT is not None:
-        return _TRITON_PIECEWISE_PROJECT
-    if _TRITON_PIECEWISE_PROJECT_IMPORT_ERROR is not None:
-        raise RuntimeError("lowpass token projection Triton kernel is unavailable") from (
-            _TRITON_PIECEWISE_PROJECT_IMPORT_ERROR
-        )
-    try:
-        from lowpass_triton import piecewise_project
-    except Exception as exc:  # pragma: no cover - depends on optional CUDA/Triton runtime.
-        _TRITON_PIECEWISE_PROJECT_IMPORT_ERROR = exc
-        raise RuntimeError("lowpass token projection Triton kernel is unavailable") from exc
-    _TRITON_PIECEWISE_PROJECT = piecewise_project
-    return piecewise_project
-
-
-def _project_chunks(
-    chunks: Tensor,
-    projector_kind: str,
-    keep: int,
-    hadamard_backend: str,
-) -> Tensor:
-    """Project [n_chunks, chunk_size, hidden] → [n_chunks, keep, hidden]."""
-    if (
-        chunks.is_cuda
-        and projector_kind in {"hadamard", "haar"}
-        and hadamard_backend != "dense"
-        and os.environ.get("LOWPASS_DISABLE_TRITON", "0") != "1"
-    ):
-        try:
-            coefficients_and_segment_len = _piecewise_projector_coefficients(
-                projector_kind,
-                int(chunks.shape[-2]),
-                int(keep),
-                chunks.device,
-                chunks.dtype,
-            )
-            if coefficients_and_segment_len is not None:
-                coefficients, segment_len = coefficients_and_segment_len
-                return _load_triton_piecewise_project()(
-                    chunks.contiguous(), coefficients, segment_len=segment_len
-                )
-        except Exception:
-            if os.environ.get("LOWPASS_REQUIRE_TRITON", "0") == "1":
-                raise
-    projector = _fixed_projector(
-        projector_kind, int(chunks.shape[-2]), int(keep), chunks.device, chunks.dtype
-    )
-    return torch.einsum("rl,nlc->nrc", projector, chunks)
-
-
-def _reconstruct_chunks(
-    lowpass: Tensor,
-    chunk_size: int,
-    projector_kind: str,
-) -> Tensor:
-    """Inverse-project [n_chunks, keep, hidden] → [n_chunks, chunk_size, hidden]."""
-    projector = _fixed_projector(
-        projector_kind, int(chunk_size), int(lowpass.shape[-2]), lowpass.device, lowpass.dtype
-    )
-    # projector is [keep, chunk_size]; inverse is projector.T (since orthonormal).
-    return torch.einsum("rl,nrc->nlc", projector, lowpass).contiguous()
-
-
-_LOWPASS_TAG = "lowpass-activation-v1"
-
-
-def _make_pack_unpack(config: LowpassConfig, seq_len: int):
-    """Build pack/unpack functions closed over the run's config and seq_len."""
-
-    chunk_size = int(config.chunk_size)
-    keep = int(config.keep)
-    projector_kind = config.projector_kind
-    hadamard_backend = config.hadamard_backend
-    min_hidden_dim = int(config.min_hidden_dim)
-    max_hidden_dim = int(config.max_hidden_dim)
-    expected_token_axes = {seq_len, seq_len - 1}  # HF sometimes drops the last position
-    log_first_n_shapes = int(os.environ.get("LOWPASS_LOG_SHAPES", "0"))
-    seen_shapes: dict[tuple, int] = {}
-
-    def pack(tensor: Tensor) -> Any:
-        # Conservative filter: only compress tensors that look like
-        # [batch, seq, hidden] hidden states. Skip everything else
-        # (parameter leaves, scalars, attention masks, kv caches, etc.).
-        # Accept two shapes:
-        #   [batch, seq, hidden]  — canonical residual/MLP layout (ndim==3)
-        #   [batch*seq, hidden]   — flattened layout commonly used inside
-        #                           fused MLP/attention kernels (ndim==2)
-        # Reject higher-rank shapes ([B,H,S,S] attention scores, etc.) which
-        # don't behave well under per-token Hadamard projection.
-        if (
-            not config.enabled
-            or not tensor.is_cuda
-            or not tensor.is_floating_point()
-            or tensor.ndim not in (2, 3)
-            or tensor.shape[-1] < min_hidden_dim
-            or (max_hidden_dim > 0 and tensor.shape[-1] > max_hidden_dim)
-        ):
-            return tensor
-        if tensor.ndim == 3:
-            if tensor.shape[1] not in expected_token_axes:
-                return tensor
-            token_axis = 1
-        else:
-            # 2D: shape[0] should be a multiple of seq_len. We reshape to
-            # 3D [batch, seq, hidden] before projecting.
-            if tensor.shape[0] % seq_len != 0:
-                return tensor
-            implied_batch = tensor.shape[0] // seq_len
-            if implied_batch < 1 or implied_batch > 64:
-                return tensor
-            tensor = tensor.reshape(implied_batch, seq_len, tensor.shape[1])
-            token_axis = 1
-        token_count = int(tensor.shape[token_axis])
-        if token_count < chunk_size or token_count % chunk_size != 0:
-            return tensor
-        # Reshape to [prefix, n_chunks, chunk_size, suffix...] then to
-        # [prefix*n_chunks, chunk_size, suffix_numel] for projection.
-        prefix_shape = tuple(tensor.shape[:token_axis])
-        suffix_shape = tuple(tensor.shape[token_axis + 1 :])
-        suffix_numel = int(math.prod(suffix_shape))
-        if suffix_numel < min_hidden_dim:
-            return tensor
-        prefix_numel = int(math.prod(prefix_shape))
-        n_chunks = token_count // chunk_size
-        if log_first_n_shapes:
-            shape_key = tuple(tensor.shape)
-            if shape_key not in seen_shapes and len(seen_shapes) < log_first_n_shapes:
-                print(f"LOWPASS_SHAPE_FIRST_SEEN: {shape_key} dtype={tensor.dtype}", flush=True)
-            seen_shapes[shape_key] = seen_shapes.get(shape_key, 0) + 1
-        with torch.no_grad(), torch.autocast("cuda", enabled=False):
-            view = tensor.reshape(prefix_numel, n_chunks, chunk_size, suffix_numel)
-            chunks = view.reshape(prefix_numel * n_chunks, chunk_size, suffix_numel).contiguous()
-            lowpass = _project_chunks(
-                chunks, projector_kind, keep, hadamard_backend
-            ).contiguous()
-        return (
-            _LOWPASS_TAG,
-            lowpass,
-            tuple(tensor.shape),
-            prefix_shape,
-            suffix_shape,
-            token_axis,
-            token_count,
-            tensor.dtype,
-        )
-
-    def unpack(packed: Any) -> Tensor:
-        if not (isinstance(packed, tuple) and packed and packed[0] == _LOWPASS_TAG):
-            return packed
-        (
-            _tag,
-            lowpass,
-            original_shape,
-            prefix_shape,
-            suffix_shape,
-            token_axis,
-            token_count,
-            original_dtype,
-        ) = packed
-        with torch.no_grad(), torch.autocast("cuda", enabled=False):
-            chunks = _reconstruct_chunks(lowpass, chunk_size, projector_kind)
-            n_chunks = token_count // chunk_size
-            suffix_numel = int(math.prod(suffix_shape))
-            # `chunks` has shape [prefix_numel * n_chunks, chunk_size, suffix_numel].
-            # Restore to the ORIGINAL tensor shape via reshape (handles both
-            # ndim==2 flattened and ndim==3 layouts correctly).
-            restored = chunks.reshape(original_shape)
-            return restored.to(original_dtype)
-
-    return pack, unpack
-
-
-def activation_save_context(config: LowpassConfig, seq_len: int):
-    """Return a context manager that installs lowpass activation packing.
-
-    Usage:
-        with activation_save_context(config, seq_len):
-            out = model(input_ids=..., ...)
-            out.loss.backward()
-    """
-    if not config.enabled:
-        return contextlib.nullcontext()
-    pack, unpack = _make_pack_unpack(config, seq_len)
-    return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
-
-
-# ---------------------------------------------------------------------------
-# Per-Linear patching path: replaces every nn.Linear with LowpassLinear so the
-# autograd Function saves a Hadamard-projected input instead of the raw input.
-# Catches MLP intermediates and attention Q/K/V/O inputs that don't appear in
-# the model-wide `saved_tensors_hooks` view (e.g. when the MLP uses a fused
-# kernel that bypasses the global save_for_backward path).
-# ---------------------------------------------------------------------------
-
-
 class _LowpassLinearFunction(torch.autograd.Function):
-    """`F.linear` with Hadamard-projected `x_hat` saved instead of `x`.
+    """Whole-sequence low-rank projection (matches AdaptiveRoundingSimp `instant.py`).
 
-    Forward: exact `y = F.linear(x, w, b)`.
+    Forward: exact `y = F.linear(x, w, b)`; saves
+    `x_hat = projector @ x` of shape `[..., keep, hidden]` instead of
+    the full `[..., seq, hidden]` input.
+
     Backward:
-      grad_x = grad_output @ weight                    (exact)
-      grad_w = go_hat.T @ x_hat                        (approximate)
-      grad_b = grad_output.sum(reduce_dims)            (exact)
+      grad_x = grad_output @ weight                  (exact)
+      grad_w = einsum("nro,nri->oi", go_hat, x_hat)  (low-rank approx)
+      grad_b = grad_output.sum(reduce_dims)          (exact)
     """
 
     @staticmethod
-    def forward(ctx, x, weight, bias, projector_kind, chunk_size, keep, hadamard_backend):
+    def forward(ctx, x, weight, bias, projector_kind, keep):
         y = F.linear(x, weight, bias)
-        ctx.input_shape = tuple(x.shape)
         ctx.input_dtype = x.dtype
         ctx.weight_dtype = weight.dtype
         ctx.has_bias = bias is not None
         ctx.projector_kind = str(projector_kind)
-        ctx.chunk_size = int(chunk_size)
         ctx.keep = int(keep)
-        ctx.hadamard_backend = str(hadamard_backend)
-        x_hat = _chunk_and_project(
-            x, ctx.projector_kind, ctx.chunk_size, ctx.keep, ctx.hadamard_backend
+        x_work = x if x.ndim >= 3 else x.unsqueeze(0)
+        seq_len_actual = int(x_work.shape[-2])
+        projector = _fixed_projector(
+            ctx.projector_kind, seq_len_actual, ctx.keep, x_work.device, x_work.dtype
         )
+        x_hat = torch.einsum("rl,...lc->...rc", projector, x_work)
         ctx.save_for_backward(x_hat.contiguous(), weight)
         return y
 
     @staticmethod
     def backward(ctx, grad_output):
         x_hat, weight = ctx.saved_tensors
-        work_dtype = weight.dtype if weight.is_floating_point() else grad_output.dtype
+        work_dtype = x_hat.dtype
         go = grad_output.to(work_dtype)
         grad_x = grad_weight = grad_bias = None
 
@@ -451,40 +195,23 @@ class _LowpassLinearFunction(torch.autograd.Function):
             grad_x = go.matmul(weight.to(work_dtype)).to(ctx.input_dtype)
 
         if ctx.needs_input_grad[1]:
-            go_hat = _chunk_and_project(
-                grad_output, ctx.projector_kind, ctx.chunk_size, ctx.keep, ctx.hadamard_backend
-            ).to(work_dtype)
-            x_work = x_hat.to(work_dtype)
-            grad_weight = go_hat.reshape(-1, go_hat.shape[-1]).T.matmul(
-                x_work.reshape(-1, x_work.shape[-1])
+            go_work = go if go.ndim >= 3 else go.unsqueeze(0)
+            seq_len_actual = int(go_work.shape[-2])
+            projector = _fixed_projector(
+                ctx.projector_kind, seq_len_actual, ctx.keep, go.device, work_dtype
+            )
+            go_hat = torch.einsum("rl,...lo->...ro", projector, go_work)
+            grad_weight = torch.einsum(
+                "nro,nri->oi",
+                go_hat.reshape(-1, go_hat.shape[-2], go_hat.shape[-1]),
+                x_hat.reshape(-1, x_hat.shape[-2], x_hat.shape[-1]),
             ).to(ctx.weight_dtype)
 
         if ctx.has_bias and ctx.needs_input_grad[2]:
             reduce_dims = tuple(range(grad_output.ndim - 1))
             grad_bias = grad_output.sum(dim=reduce_dims)
 
-        return grad_x, grad_weight, grad_bias, None, None, None, None
-
-
-def _chunk_and_project(
-    x: Tensor,
-    projector_kind: str,
-    chunk_size: int,
-    keep: int,
-    hadamard_backend: str,
-) -> Tensor:
-    """Reshape x → [n_chunks, chunk_size, hidden] and Hadamard-project to keep."""
-    if x.ndim == 2:
-        x = x.unsqueeze(0)
-    # x is now at least 3D. Flatten leading dims, treat dim -2 as token axis.
-    token_count = int(x.shape[-2])
-    hidden = int(x.shape[-1])
-    leading = int(x.numel()) // (token_count * hidden)
-    n_chunks = token_count // chunk_size
-    chunks = x.reshape(leading, n_chunks, chunk_size, hidden).reshape(
-        leading * n_chunks, chunk_size, hidden
-    ).contiguous()
-    return _project_chunks(chunks, projector_kind, keep, hadamard_backend).contiguous()
+        return grad_x, grad_weight, grad_bias, None, None
 
 
 class LowpassLinear(torch.nn.Module):
@@ -505,12 +232,16 @@ class LowpassLinear(torch.nn.Module):
     def _can_use_lowpass(self, x: Tensor) -> bool:
         if not self.config.enabled or not torch.is_grad_enabled():
             return False
-        chunk_size = int(self.config.chunk_size)
+        keep = int(self.config.keep)
         min_hidden_dim = int(self.config.min_hidden_dim)
         max_hidden_dim = int(self.config.max_hidden_dim)
-        token_count = int(x.shape[-2]) if x.ndim >= 2 else 0
-        hidden = int(x.shape[-1]) if x.ndim >= 1 else 0
-        if token_count < chunk_size or token_count % chunk_size != 0:
+        if x.ndim < 2:
+            return False
+        token_count = int(x.shape[-2])
+        hidden = int(x.shape[-1])
+        if token_count < keep:
+            return False
+        if self.config.projector_kind in {"hadamard", "haar"} and not _is_power_of_two(token_count):
             return False
         if hidden < min_hidden_dim:
             return False
@@ -526,9 +257,7 @@ class LowpassLinear(torch.nn.Module):
             self.weight,
             self.bias,
             self.config.projector_kind,
-            self.config.chunk_size,
             self.config.keep,
-            self.config.hadamard_backend,
         )
 
 

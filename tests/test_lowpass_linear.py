@@ -46,7 +46,7 @@ def _make_linear_and_lowpass(in_features: int, out_features: int, config: Lowpas
 class ForwardParityTest(unittest.TestCase):
     @_skip_if_no_torch
     def test_forward_matches_linear(self):
-        config = LowpassConfig(projector_kind="hadamard", chunk_size=64, keep=32, hadamard_backend="dense")
+        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
         baseline, lp = _make_linear_and_lowpass(256, 384, config)
         x = torch.randn(2, 128, 256, requires_grad=False)
         with torch.no_grad():
@@ -58,7 +58,7 @@ class ForwardParityTest(unittest.TestCase):
 class InputGradExactTest(unittest.TestCase):
     @_skip_if_no_torch
     def test_input_grad_exact(self):
-        config = LowpassConfig(projector_kind="hadamard", chunk_size=64, keep=32, hadamard_backend="dense")
+        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
         baseline, lp = _make_linear_and_lowpass(256, 384, config)
 
         x = torch.randn(2, 128, 256)
@@ -80,7 +80,7 @@ class ParamGradToleranceTest(unittest.TestCase):
     def test_param_grad_within_tolerance(self):
         # 32/64 keep ratio: param grad is approximate but should stay close to
         # the exact gradient. We assert relative RMS error is bounded.
-        config = LowpassConfig(projector_kind="hadamard", chunk_size=64, keep=32, hadamard_backend="dense")
+        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
         baseline, lp = _make_linear_and_lowpass(256, 384, config)
 
         x = torch.randn(2, 128, 256, requires_grad=True)
@@ -140,7 +140,7 @@ class ReplaceWalkerTest(unittest.TestCase):
             def forward(self, x):
                 return self.mlp(x) + self.attn(x)
 
-        config = LowpassConfig(chunk_size=64, keep=32, hadamard_backend="dense")
+        config = LowpassConfig(projector_kind="dct", keep=8, min_hidden_dim=0)
         model = TinyBlock()
         replaced = replace_linear_with_lowpass(model, config, mlp_module_filter)
         # Should hit gate_proj/up_proj/down_proj (3 MLP linears), not Q/K/V.
