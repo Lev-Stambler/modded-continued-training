@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 v2 adamw_fused lowpass mlp seed1337 (isolation)
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.460776
+Baseline eval loss: 1.015397
+Final eval loss: 0.554620
+Steps: 63
+Tokens: 2,064,384
+Supervised tokens: 2,047,533
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 303.3s
+Elapsed budget: 300.0s
+Budget tokens/sec: 6881
+Train-loop elapsed: 300.0s
+Train-loop tokens/sec: 6881

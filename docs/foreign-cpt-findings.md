@@ -256,8 +256,113 @@ uv run python scripts/push_conlang_dataset.py data/conlang_cpt/<language_id>
 ./run.sh track1 --seed 4099 --record-description "ConlangCrafter CPT seed4099" --record-contributors "@you"
 ```
 
+## v2 reset: doc-aware packed attention (2026-05-29)
+
+After the LoRA strip and 4-way optimizer ablation we discovered the
+trainer had been passing `attention_mask=torch.ones(...)` to packed
+batches, so every token could attend to all preceding tokens in the
+pack — including tokens from earlier documents in the same packed
+block. This artificially deflated baseline eval loss by ~0.2 because the
+model exploited cross-document context that doesn't exist at inference.
+
+The fix (commit `1ad3511`): track per-token doc-relative position
+offsets through packing, emit `position_ids` that reset to 0 at every
+document start, pass `attention_mask=None`. HF transformers'
+`flash_attention_2` / `flex_attention` paths detect document starts
+from `position_ids == 0` and build per-document cu_seqlens / block
+masks internally. The eval cache key was bumped to invalidate the old
+caches; record dirs gained a `v<N>/` version subfolder so v1 leaky
+records remain available but not comparable.
+
+### Same config, before / after the fix
+
+| Run | Baseline | Final | Drop | Steps |
+|---|---:|---:|---:|---:|
+| v1 leaky (AdamW fused, seq 4096, mb 1 × ga 8) | 0.854 | 0.357 | +0.497 | 77 |
+| v2 doc-aware (same config) | 1.021 | 0.348 | **+0.673** | 103 |
+
+The v2 baseline both has a higher (correct) starting loss AND drops it
+more, because cleaner attention produces cleaner gradients and a faster
+per-step throughput (11.2k vs 8.3k tokens/sec — flex_attention with
+proper per-doc block masks is more efficient than dense causal masking
+over a packed sequence).
+
+## Hadamard low-pass MLP activation compression (2026-05-29)
+
+Ported from the `nanoCPT-instant-lowpass` worktree (the GraLoRA-era
+implementation) and adapted for plain `nn.Linear` in
+`lowpass.py`. New CLI flag set: `--lowpass --lowpass-chunk-size 64
+--lowpass-keep 32 --lowpass-target-filter mlp --lowpass-projector-kind
+hadamard`.
+
+How it works: every MLP `nn.Linear` is wrapped in `LowpassLinear`
+whose backward saves `x_hat = Hadamard(x)[..., :keep, :]` (50%
+activation memory at keep=32/chunk=64) instead of the full `x`. The
+input gradient `grad_x = grad_output @ weight` stays exact; the
+parameter gradient `grad_w = go_hat.T @ x_hat` is computed from
+Hadamard-projected inputs and grad_outputs. Documents are padded to a
+multiple of `chunk_size` before packing so every Hadamard chunk is
+pure-within-doc (pad labels are `-100`, pads add no gradient).
+
+### Isolation result (v2, only `--lowpass` added)
+
+Same config as the v2 baseline above, just `--lowpass` flag added:
+
+| Run | Baseline | Final | Drop | Steps | tokens/s |
+|---|---:|---:|---:|---:|---:|
+| v2 baseline | 1.021 | 0.348 | +0.673 | 103 | 11,161 |
+| v2 + `--lowpass` | 1.015 | 0.555 | +0.461 | **63** | **6,881** |
+
+**Lowpass alone cuts throughput by ~38 %** (and therefore step count by
+the same fraction, since each step does the same amount of work).
+Baseline eval loss is essentially identical, so the projection isn't
+breaking the eval distribution — the loss is just frozen earlier
+because we get 60 % as many optimizer steps.
+
+### Why this implementation isn't a win at our scale
+
+1. **`torch.compile` graph-break per LowpassLinear.** `dynamo` can't
+   trace through `torch.autograd.Function.apply`, so each of the 144
+   wrapped MLP linears breaks the compiled graph into a separate
+   segment. With 144 graph breaks per forward + 144 per backward, the
+   model effectively runs eager between segments. The Hadamard
+   projection itself is cheap (~5 ms via the lifted Triton piecewise
+   kernel); the compile fragmentation is the killer.
+2. **Gradient checkpointing already eliminates the savings.** With
+   `--gradient-checkpointing auto` (on for 4B full-FT on a single H100),
+   activations aren't held across the full forward/backward boundary —
+   they're recomputed inside each transformer block at backward time.
+   The peak GPU memory is dominated by optimizer state and the
+   single-block recompute window, neither of which lowpass touches.
+3. **The two combine badly.** Disabling checkpointing to make lowpass's
+   compression matter pushes the peak memory above 80 GiB on SXM5 even
+   with adamw8bit + keep=32 — the activation tensor for a single
+   forward pass at seq=4096 is ~40 GiB on its own, and a 50 %
+   compression on MLP only saves a few GiB.
+
+### What a real win would need
+
+- **Kernel-fused lowpass linear** (Triton matmul that simultaneously
+  produces `y = x @ W` *and* `x_hat = Hadamard_chunk(x)[:keep]`, so the
+  Hadamard projection costs no extra HBM round-trips and there's no
+  graph break). The `instant-lowpass` worktree had this for GraLoRA's
+  mix kernel; a plain-Linear equivalent doesn't yet exist.
+- **Aggressive compression** (`keep=8` or 16, giving 4×–8× savings)
+  combined with kernel fusion would actually free 10–20 GiB of
+  activation memory. At that point a much larger seq_len or
+  micro_batch_size becomes affordable and the throughput hit is offset
+  by more tokens per step.
+
+For Track 2's 5-minute budget at 4B full-FT, the current implementation
+is dominated by the compile-fragmentation overhead. Leaving the code
+in (`--lowpass`) for future kernel work, but the v2 leaderboard
+record stays the doc-aware-attention adamw_fused baseline at **+0.673**.
+
 ## References
 
 - ConlangCrafter (Alper et al., 2026), arXiv [2508.06094](https://arxiv.org/abs/2508.06094).
 - SumTablets (Simmons, 2024), arXiv [2602.22200](https://arxiv.org/abs/2602.22200).
 - Linear A Digital Corpus (Salgarella & Castellan, 2015), [aclanthology W15-3715](https://aclanthology.org/W15-3715.pdf).
+- Efficient sequence packing without cross-contamination, Krell et al. 2021, arXiv [2107.02027](https://arxiv.org/abs/2107.02027).
+- Enhancing training efficiency using packing with flash attention,
+  arXiv [2407.09105](https://arxiv.org/abs/2407.09105).
