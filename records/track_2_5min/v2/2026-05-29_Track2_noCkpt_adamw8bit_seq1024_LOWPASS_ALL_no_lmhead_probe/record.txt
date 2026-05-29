@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 noCkpt adamw8bit seq1024 LOWPASS ALL_no_lmhead probe
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.774196
+Baseline eval loss: 1.303133
+Final eval loss: 0.528937
+Steps: 139
+Tokens: 1,138,688
+Supervised tokens: 1,137,576
+Eval supervised tokens: 262,144
+Compile + warmup (untimed): 262.4s
+Elapsed budget: 302.3s
+Budget tokens/sec: 3766
+Train-loop elapsed: 302.3s
+Train-loop tokens/sec: 3766

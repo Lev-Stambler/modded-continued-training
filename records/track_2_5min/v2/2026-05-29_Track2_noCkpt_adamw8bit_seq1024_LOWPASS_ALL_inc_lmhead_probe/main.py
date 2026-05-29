@@ -51,8 +51,8 @@ DEFAULT_SEQUENCE_PACKING = True
 DEFAULT_PACKING_STRATEGY = "stream_concat_no_padding"
 DEFAULT_CPT_TEXT_FIELD = "text"
 DEFAULT_LOWPASS_KEEP = 8
-DEFAULT_LOWPASS_TARGET_FILTER = "all_no_lmhead"
-LOWPASS_TARGET_FILTER_CHOICES = {"mlp", "all", "all_no_lmhead", "none"}
+DEFAULT_LOWPASS_TARGET_FILTER = "mlp"
+LOWPASS_TARGET_FILTER_CHOICES = {"mlp", "all", "none"}
 # Eval-correctness version. Bump when a change alters absolute eval-loss
 # numbers (e.g. document-aware attention masking, eval-set tokenization
 # changes). Records under records/<track>/v<N>/ are only comparable within

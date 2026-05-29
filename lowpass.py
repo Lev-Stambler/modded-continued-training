@@ -310,6 +310,14 @@ def make_module_filter(target: str) -> Callable[[str, torch.nn.Linear], bool] | 
         return mlp_module_filter
     if normalized in {"all", "every", "any"}:
         return None  # None means replace every nn.Linear
+    if normalized in {"all_no_lmhead", "all_except_lmhead", "all_minus_lmhead"}:
+        # All Linears EXCEPT lm_head / embed projection — those have the
+        # vocab dimension (~248k for Qwen3.5) and compressing the input
+        # to lm_head means the grad_w for the LM head itself becomes
+        # approximate, which is the most sensitive layer in CE loss.
+        return lambda name, _module: (
+            "lm_head" not in name.lower() and "embed_tokens" not in name.lower()
+        )
     if normalized in {"none", "off"}:
         return lambda _name, _module: False
     raise ValueError(f"unknown lowpass target filter {target!r}")
