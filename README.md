@@ -11,7 +11,7 @@ language corpus that the base model has never seen.
 score = baseline_eval_loss − final_eval_loss
 ```
 
-Higher is better. The current Track 2 record (v2 / doc-aware) is **+0.6730**.
+Higher is better. The current Track 2 record (v2 / doc-aware) is **+0.6766**.
 
 ## Leaderboard
 
@@ -30,7 +30,9 @@ live under `records/<track>/v<N>/`.
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|---:|---|---|---|---|
-| 1 | **+0.6730** | Full FT, AdamW fused, lr 2e-5, mb 1 × ga 8, seed 1337, doc-aware position_ids reset at every document start (attention does not cross document boundaries), flex-attention, max-autotune-no-cudagraphs | 2026-05-29 | [summary](records/track_2_5min/v2/2026-05-29_Track2_docaware_adamw_fused_seed1337/summary.json) | @levstamb |
+| 1 | **+0.6766** | Full FT, AdamW fused, lr 2e-5, mb 8 × ga 1 (96.2% VRAM), seed 1337, doc-aware position_ids reset at every document start, flex-attention, max-autotune-no-cudagraphs | 2026-05-29 | [summary](records/track_2_5min/v2/2026-05-29_Track2_docaware_adamw_fused_mb8_ga1_max95VRAM_rebaseline_seed1337/summary.json) | @levstamb |
+| 2 | +0.6773 | Full FT, AdamW fused, mb 4 × ga 2 (78.8% VRAM) | 2026-05-29 | [summary](records/track_2_5min/v2/2026-05-29_Track2_docaware_adamw_fused_mb4_ga2_highVRAM_rebaseline_seed1337/summary.json) | @levstamb |
+| 3 | +0.6730 | Full FT, AdamW fused, mb 1 × ga 8 (67.9% VRAM) — archived v2 anchor | 2026-05-29 | [summary](records/track_2_5min/v2/2026-05-29_Track2_docaware_adamw_fused_seed1337/summary.json) | @levstamb |
 
 ### Track 2 — 5 minutes (v1 — leaky causal attention, retired)
 
