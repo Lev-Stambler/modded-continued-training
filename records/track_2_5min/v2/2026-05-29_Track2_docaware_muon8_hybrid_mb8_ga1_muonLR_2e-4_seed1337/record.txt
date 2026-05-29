@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 docaware muon8 hybrid mb8 ga1 muonLR 2e-4 seed1337
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.651646
+Baseline eval loss: 1.021390
+Final eval loss: 0.369744
+Steps: 75
+Tokens: 2,457,600
+Supervised tokens: 2,457,000
+Eval supervised tokens: 262,144
+Compile + warmup (untimed): 329.1s
+Elapsed budget: 303.7s
+Budget tokens/sec: 8093
+Train-loop elapsed: 303.7s
+Train-loop tokens/sec: 8093
