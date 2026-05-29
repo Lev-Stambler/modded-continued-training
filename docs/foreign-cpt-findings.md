@@ -340,23 +340,68 @@ because we get 60 % as many optimizer steps.
    forward pass at seq=4096 is ~40 GiB on its own, and a 50 %
    compression on MLP only saves a few GiB.
 
+### Attempt: `@torch.compiler.disable` workaround
+
+To test whether the slowdown was purely from graph fragmentation, the
+`LowpassLinear._apply_lowpass` method was wrapped with
+`@torch.compiler.disable`. This makes dynamo treat each LowpassLinear
+as a single opaque op (no graph break) instead of fragmenting the
+compiled region. Result:
+
+| Run | tokens/s | Steps | Peak mem |
+|---|---:|---:|---:|
+| v2 baseline | 11,161 | 103 | 53.7 GiB |
+| v2 + lowpass (no disable) | 6,881 | 63 | 53.7 GiB |
+| v2 + lowpass (with disable) | 6,368 | 59 | 53.7 GiB |
+
+`@torch.compiler.disable` did **not** recover throughput — it traded
+one source of overhead (graph fragmentation) for another (per-boundary
+guard checks + state save/load at the disable points). The decorator
+remains in the source because the principle is correct, but it's not
+the bottleneck.
+
+### Why the headline gain never materialised
+
+The real reason lowpass doesn't pay off at this configuration:
+**peak GPU memory is not set by per-Linear saved activations.** It is
+set by `(optimizer_state, model_weights, single-block-recompute
+activations)`, in that order, none of which lowpass shrinks:
+
+- Optimizer state (~32 GiB for `adamw_fused` on 4B): always resident.
+- Model bf16 weights (~8 GiB): always resident.
+- During backward, each transformer block recomputes its forward
+  (gradient checkpointing) and momentarily holds intermediate
+  activations (~5–10 GiB). Lowpass would reduce these — but they're
+  recomputed and discarded per-block, so the *steady-state peak* is
+  already low.
+
+The v2 baseline already runs at 53.7 GiB / 80 GiB = 67 %. Adding
+lowpass keeps the peak at 53.7 GiB (no savings). With no memory
+freed, there's no headroom to enable bigger micro_batch_size /
+seq_len that would amortise the projection cost. Lowpass becomes
+pure overhead.
+
 ### What a real win would need
 
-- **Kernel-fused lowpass linear** (Triton matmul that simultaneously
-  produces `y = x @ W` *and* `x_hat = Hadamard_chunk(x)[:keep]`, so the
-  Hadamard projection costs no extra HBM round-trips and there's no
-  graph break). The `instant-lowpass` worktree had this for GraLoRA's
-  mix kernel; a plain-Linear equivalent doesn't yet exist.
-- **Aggressive compression** (`keep=8` or 16, giving 4×–8× savings)
-  combined with kernel fusion would actually free 10–20 GiB of
-  activation memory. At that point a much larger seq_len or
-  micro_batch_size becomes affordable and the throughput hit is offset
-  by more tokens per step.
+- **Kernel-fused lowpass linear**: a Triton matmul that simultaneously
+  produces `y = x @ W` *and* `x_hat = Hadamard_chunk(x)[:keep]` in a
+  single HBM round-trip. The `instant-lowpass` worktree shipped this
+  for GraLoRA's mix kernel; an equivalent for plain Linear doesn't yet
+  exist.
+- **Aggressive compression at the checkpoint boundary**: lowpass needs
+  to replace what's stored *between* checkpoint blocks (i.e., the
+  block output, not the per-Linear input). At that level the peak
+  memory bound is touchable.
+- **Or switch from optimizer-state-bound to activation-bound**: use
+  `adamw8bit` (frees ~24 GiB of opt state) AND a much larger seq_len
+  / mb so activations dominate the peak. Then lowpass on activations
+  becomes the lever.
 
-For Track 2's 5-minute budget at 4B full-FT, the current implementation
-is dominated by the compile-fragmentation overhead. Leaving the code
-in (`--lowpass`) for future kernel work, but the v2 leaderboard
-record stays the doc-aware-attention adamw_fused baseline at **+0.673**.
+For Track 2's 5-minute budget at 4B full-FT with default optimizer +
+checkpointing, lowpass is a net loss. Leaving the `--lowpass` code
+path in (it's correct, just unprofitable at this config) for the
+future kernel-fusion work; the v2 leaderboard #1 stays the doc-aware
+adamw_fused baseline at **+0.673**.
 
 ## References
 

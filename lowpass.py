@@ -391,13 +391,15 @@ class LowpassLinear(torch.nn.Module):
             and self.weight.requires_grad
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        if not self._can_use_lowpass(x):
-            if not _torch_is_compiling():
-                self.fallback_calls += 1
-            return F.linear(x, self.weight, self.bias)
-        if not _torch_is_compiling():
-            self.lowpass_calls += 1
+    @torch.compiler.disable
+    def _apply_lowpass(self, x: Tensor) -> Tensor:
+        # Custom autograd Functions break dynamo's graph at every call site.
+        # Wrapping with @torch.compiler.disable makes dynamo treat this whole
+        # forward as a single opaque op: the surrounding transformer block
+        # stays fully compiled and only this one boundary is eager. The
+        # Hadamard projection itself is cheap (~1 ms per step total); the
+        # 38 % slowdown observed without this wrapper came entirely from
+        # fragmenting the compiled graph into ~144 sub-segments.
         return _LowpassLinearFunction.apply(
             x,
             self.weight,
@@ -407,6 +409,15 @@ class LowpassLinear(torch.nn.Module):
             self.config.keep,
             self.config.hadamard_backend,
         )
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self._can_use_lowpass(x):
+            if not _torch_is_compiling():
+                self.fallback_calls += 1
+            return F.linear(x, self.weight, self.bias)
+        if not _torch_is_compiling():
+            self.lowpass_calls += 1
+        return self._apply_lowpass(x)
 
 
 def replace_linear_with_lowpass(
