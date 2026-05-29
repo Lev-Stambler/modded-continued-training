@@ -157,14 +157,23 @@ def _fixed_projector(kind: str, seq_len: int, rank: int, device: torch.device, d
 class _LowpassLinearFunction(torch.autograd.Function):
     """Whole-sequence low-rank projection (matches AdaptiveRoundingSimp `instant.py`).
 
-    Forward: exact `y = F.linear(x, w, b)`; saves
-    `x_hat = projector @ x` of shape `[..., keep, hidden]` instead of
-    the full `[..., seq, hidden]` input.
+    The Function has two arms keyed by `ctx.mode`:
 
-    Backward:
-      grad_x = grad_output @ weight                  (exact)
-      grad_w = einsum("nro,nri->oi", go_hat, x_hat)  (low-rank approx)
-      grad_b = grad_output.sum(reduce_dims)          (exact)
+    - **`exact`**: any call whose `x` can't be cleanly projected
+      (`x.ndim < 3`, seq_len not power-of-two for Hadamard/Haar, etc.)
+      falls back to standard `F.linear` semantics and saves `(x, weight)`
+      unmodified. Backward runs the exact `grad_x = go @ weight`,
+      `grad_w = go^T @ x` path. Required for `torch.compile`: every
+      call site must save a tensor of a stable shape; without this guard
+      the 2D/3D conditional inside the lowpass arm produced traces with
+      a leading-dim-1 saved tensor that inductor's `assert_size_stride`
+      rejected on recompile.
+    - **`lowpass`**: forward saves `x_hat = projector @ x` of shape
+      `[batch, keep, hidden]` (always 3D, batch is the real batch dim).
+      grad_x is exact; grad_w is the low-rank
+      `einsum("nro,nri->oi", go_hat, x_hat)` approximation.
+
+    The two-arm structure mirrors `instant.py:484-595`.
     """
 
     @staticmethod
@@ -173,19 +182,46 @@ class _LowpassLinearFunction(torch.autograd.Function):
         ctx.input_dtype = x.dtype
         ctx.weight_dtype = weight.dtype
         ctx.has_bias = bias is not None
-        ctx.projector_kind = str(projector_kind)
-        ctx.keep = int(keep)
-        x_work = x if x.ndim >= 3 else x.unsqueeze(0)
-        seq_len_actual = int(x_work.shape[-2])
-        projector = _fixed_projector(
-            ctx.projector_kind, seq_len_actual, ctx.keep, x_work.device, x_work.dtype
-        )
-        x_hat = torch.einsum("rl,...lc->...rc", projector, x_work)
+        # Guard: short-circuit to the exact path for anything we can't
+        # cleanly project along a 3D `[batch, seq, hidden]` axis.
+        if x.ndim < 3 or x.shape[-2] < int(keep):
+            ctx.mode = "exact"
+            ctx.save_for_backward(x, weight)
+            return y
+        projector_kind = str(projector_kind)
+        keep = int(keep)
+        seq_len_actual = int(x.shape[-2])
+        if projector_kind in {"hadamard", "haar"} and not _is_power_of_two(seq_len_actual):
+            ctx.mode = "exact"
+            ctx.save_for_backward(x, weight)
+            return y
+        ctx.mode = "lowpass"
+        ctx.projector_kind = projector_kind
+        ctx.keep = keep
+        projector = _fixed_projector(projector_kind, seq_len_actual, keep, x.device, x.dtype)
+        x_hat = torch.einsum("rl,...lc->...rc", projector, x)
         ctx.save_for_backward(x_hat.contiguous(), weight)
         return y
 
     @staticmethod
     def backward(ctx, grad_output):
+        if ctx.mode == "exact":
+            x, weight = ctx.saved_tensors
+            work_dtype = weight.dtype if weight.is_floating_point() else grad_output.dtype
+            go = grad_output.to(work_dtype)
+            grad_x = grad_weight = grad_bias = None
+            if ctx.needs_input_grad[0]:
+                grad_x = go.matmul(weight.to(work_dtype)).to(ctx.input_dtype)
+            if ctx.needs_input_grad[1]:
+                grad_weight = go.reshape(-1, go.shape[-1]).T.matmul(
+                    x.to(work_dtype).reshape(-1, x.shape[-1])
+                ).to(ctx.weight_dtype)
+            if ctx.has_bias and ctx.needs_input_grad[2]:
+                reduce_dims = tuple(range(grad_output.ndim - 1))
+                grad_bias = grad_output.sum(dim=reduce_dims)
+            return grad_x, grad_weight, grad_bias, None, None
+
+        # lowpass arm — x_hat is known to be 3D [batch, keep, hidden].
         x_hat, weight = ctx.saved_tensors
         work_dtype = x_hat.dtype
         go = grad_output.to(work_dtype)
@@ -195,12 +231,11 @@ class _LowpassLinearFunction(torch.autograd.Function):
             grad_x = go.matmul(weight.to(work_dtype)).to(ctx.input_dtype)
 
         if ctx.needs_input_grad[1]:
-            go_work = go if go.ndim >= 3 else go.unsqueeze(0)
-            seq_len_actual = int(go_work.shape[-2])
+            seq_len_actual = int(go.shape[-2])
             projector = _fixed_projector(
                 ctx.projector_kind, seq_len_actual, ctx.keep, go.device, work_dtype
             )
-            go_hat = torch.einsum("rl,...lo->...ro", projector, go_work)
+            go_hat = torch.einsum("rl,...lo->...ro", projector, go)
             grad_weight = torch.einsum(
                 "nro,nri->oi",
                 go_hat.reshape(-1, go_hat.shape[-2], go_hat.shape[-1]),

@@ -75,6 +75,49 @@ class InputGradExactTest(unittest.TestCase):
         self.assertTrue(torch.allclose(x_ref.grad, x_lp.grad, atol=1e-5, rtol=1e-5))
 
 
+class ExactPathTest(unittest.TestCase):
+    """The autograd Function must short-circuit to exact `F.linear`
+    semantics for inputs that can't be cleanly projected — needed for
+    torch.compile shape stability."""
+
+    @_skip_if_no_torch
+    def test_2d_input_grad_matches_linear_exactly(self):
+        # 2D input [batch, hidden] triggers the exact short-circuit.
+        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
+        baseline, lp = _make_linear_and_lowpass(256, 384, config)
+        x_ref = torch.randn(16, 256, requires_grad=True)
+        x_lp = x_ref.detach().clone().requires_grad_(True)
+        y_ref = baseline(x_ref)
+        y_lp = lp(x_lp)
+        grad_out = torch.randn_like(y_ref)
+        y_ref.backward(grad_out)
+        y_lp.backward(grad_out)
+        # Both grad_x and grad_w should match exactly (within fp tolerance).
+        self.assertTrue(torch.allclose(x_ref.grad, x_lp.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(
+            torch.allclose(baseline.weight.grad, lp.weight.grad, atol=1e-5, rtol=1e-5)
+        )
+
+    @_skip_if_no_torch
+    def test_seq_too_short_for_rank_falls_back_to_exact(self):
+        # 3D input but seq < keep: the projection would be ill-defined
+        # → must fall back to the exact path.
+        config = LowpassConfig(projector_kind="hadamard", keep=64, min_hidden_dim=0)
+        baseline, lp = _make_linear_and_lowpass(256, 384, config)
+        x = torch.randn(2, 4, 256, requires_grad=True)  # seq=4 < keep=64
+        x_ref = x.detach().clone().requires_grad_(True)
+        x_lp = x.detach().clone().requires_grad_(True)
+        y_ref = baseline(x_ref)
+        y_lp = lp(x_lp)
+        grad_out = torch.randn_like(y_ref)
+        y_ref.backward(grad_out)
+        y_lp.backward(grad_out)
+        self.assertTrue(torch.allclose(x_ref.grad, x_lp.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(
+            torch.allclose(baseline.weight.grad, lp.weight.grad, atol=1e-5, rtol=1e-5)
+        )
+
+
 class ParamGradToleranceTest(unittest.TestCase):
     @_skip_if_no_torch
     def test_param_grad_within_tolerance(self):
