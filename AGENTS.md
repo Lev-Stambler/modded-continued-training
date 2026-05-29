@@ -68,6 +68,48 @@ invalidates the cached image and triggers a full rebuild. Cold image
 build is ~5-10 min on top of the run itself. Batch unrelated `main.py`
 edits before launching long ablations.
 
+## Maximize VRAM utilization
+
+The H100 has 80 GiB (SXM5) or 94 GiB (NVL). A correct Track 2 config should
+push `peak_cuda_memory_allocated_gib` close to **the full VRAM** — anywhere
+below ~95 % means we're leaving training capacity on the table. Idle VRAM
+is wasted activations, which is wasted tokens-per-step, which is wasted
+loss drop in the fixed budget.
+
+If a run lands at e.g. 54 GiB on an 80 GiB card, that's ~25 GiB of unused
+activation room — bump `--seq-len`, `--micro-batch-size`, or enable
+features that trade memory for tokens (`--lowpass --gradient-checkpointing
+false`, `--optimizer-name adamw8bit` to free optimizer state, etc.) until
+the next run trips OOM, then back off one notch.
+
+Goal: every accepted record's `summary.json` should have
+`peak_cuda_memory_allocated_fraction ≥ 0.95`. Anything lower is a sign
+the config hasn't been pushed.
+
+## Document-aware packed sequences (don't leak across boundaries)
+
+This trainer packs multiple documents into fixed-length blocks via
+`stream_concat_no_padding`. Two correctness rules to maintain:
+
+1. **Attention must not cross document boundaries.** Pass `position_ids`
+   that reset to 0 at every new document start; set `attention_mask=None`.
+   HF transformers' `flash_attention_2` / `flex_attention` paths detect
+   document starts from `position_ids == 0` and build per-document
+   block masks internally. Never pass `attention_mask=torch.ones(...)`
+   to a packed batch — that's what produced the v1 leaky-attention
+   leaderboard (~0.2 lower baseline than the v2 doc-aware run).
+
+2. **Low-pass activation compression must not cross document
+   boundaries** either. When `--lowpass` is on, each document's tokens
+   are padded up to a multiple of `--lowpass-chunk-size` with pad tokens
+   (labels `-100`, ignored in loss). This guarantees every Hadamard
+   chunk is purely within one document.
+
+When changing the eval/packing/attention semantics in a way that alters
+absolute eval-loss numbers, bump `EVAL_VERSION` in `main.py` and start a
+new `records/<track>/v<N+1>/` subdirectory — only same-version records
+are directly comparable.
+
 ## Run wiring sanity-check after the timed boundary
 
 `run.sh smoke` is the canonical end-to-end check that the

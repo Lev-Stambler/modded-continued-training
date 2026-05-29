@@ -11,9 +11,14 @@ language corpus that the base model has never seen.
 score = baseline_eval_loss − final_eval_loss
 ```
 
-Higher is better. The current Track 2 record is **+0.497**.
+Higher is better. The current Track 2 record (v2 / doc-aware) is **+0.6730**.
 
 ## Leaderboard
+
+Records are versioned by `EVAL_VERSION` in `main.py`. Each version bump
+indicates a correctness-affecting change to the eval/attention/packing
+path; numbers are only comparable **within a single version**. Records
+live under `records/<track>/v<N>/`.
 
 ### Track 1 — 30 minutes
 
@@ -21,14 +26,26 @@ Higher is better. The current Track 2 record is **+0.497**.
 |---|---:|---|---|---|---|
 | 1 | — | (open) | — | — | — |
 
-### Track 2 — 5 minutes
+### Track 2 — 5 minutes (v2 — doc-aware packed attention)
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|---:|---|---|---|---|
-| 1 | **+0.4972** | Full FT, AdamW fused, lr 2e-5, mb 1 × ga 8, seed 1337, flex-attention, max-autotune-no-cudagraphs | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_adamw_fused_full-FT_seed1337/summary.json) | @levstamb |
-| 2 | +0.4868 | Full FT, Muon8 hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_muon8_hybrid_full-FT_seed1337/summary.json) | @levstamb |
-| 3 | +0.4862 | Full FT, Muon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_muon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
-| 4 | +0.4612 | Full FT, NorMuon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_normuon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
+| 1 | **+0.6730** | Full FT, AdamW fused, lr 2e-5, mb 1 × ga 8, seed 1337, doc-aware position_ids reset at every document start (attention does not cross document boundaries), flex-attention, max-autotune-no-cudagraphs | 2026-05-29 | [summary](records/track_2_5min/v2/2026-05-29_Track2_docaware_adamw_fused_seed1337/summary.json) | @levstamb |
+
+### Track 2 — 5 minutes (v1 — leaky causal attention, retired)
+
+Earlier records ran with a uniform `attention_mask=ones` on packed
+sequences, letting later-document tokens attend to earlier-document
+tokens in the same pack. That artificially lowered the baseline eval
+loss by ~0.2; numbers are not comparable to v2 above. Kept under
+`records/track_2_5min/v1/` for historical reference only.
+
+| # | Loss drop | Description | Date | Log | Contributors |
+|---|---:|---|---|---|---|
+| 1 | +0.4972 | Full FT, AdamW fused, lr 2e-5, mb 1 × ga 8 | 2026-05-28 | [summary](records/track_2_5min/v1/2026-05-28_Track2_adamw_fused_full-FT_seed1337/summary.json) | @levstamb |
+| 2 | +0.4868 | Muon8 hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5) | 2026-05-28 | [summary](records/track_2_5min/v1/2026-05-28_Track2_muon8_hybrid_full-FT_seed1337/summary.json) | @levstamb |
+| 3 | +0.4862 | Muon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5) | 2026-05-28 | [summary](records/track_2_5min/v1/2026-05-28_Track2_muon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
+| 4 | +0.4612 | NorMuon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5) | 2026-05-28 | [summary](records/track_2_5min/v1/2026-05-28_Track2_normuon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
 
 ### Track 3 — 2 hours
 
@@ -140,7 +157,9 @@ The Modal image (also defined in `main.py`) provides:
 - Optimizers: `adamw_fused`, `adamw8bit`, Muon, Muon8 (8-bit blockwise momentum), NorMuon
 - `bitsandbytes` for `AdamW8bit`
 - Sequence packing without padding into fixed `seq_len` blocks
-- W&B (offline or online) via `--wandb-project`
+- W&B on by default (online, project `modded-continued-training`, entity
+  `umd-leans-well`); override with `--wandb-project`/`--wandb-entity` or opt out
+  per-run with `--wandb-mode disabled` (or `offline`)
 
 GPU telemetry, peak NVML memory/util, and per-step timings land in
 `metrics.jsonl` alongside `summary.json` and a `record.txt` for each run.

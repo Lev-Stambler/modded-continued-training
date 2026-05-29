@@ -3,6 +3,14 @@
 # the canonical ConlangCrafter CPT/LoRA challenge — see README for details.
 set -euo pipefail
 
+# W&B is on by default (online). main.py reads WANDB_API_KEY from the local
+# environment to build the Modal secret; source it from ~/.netrc when unset so
+# the key never has to live in git or config.
+if [[ -z "${WANDB_API_KEY:-}" ]]; then
+  WANDB_API_KEY="$(python3 -c "import netrc; print(netrc.netrc().authenticators('api.wandb.ai')[2])" 2>/dev/null || true)"
+  export WANDB_API_KEY
+fi
+
 cmd=(uv run modal run main.py)
 
 case "${1:-}" in
@@ -19,6 +27,7 @@ case "${1:-}" in
       --no-compile-model \
       --no-compile-warmup \
       --attn-implementation sdpa \
+      --wandb-mode disabled \
       "$@"
     ;;
   track1)

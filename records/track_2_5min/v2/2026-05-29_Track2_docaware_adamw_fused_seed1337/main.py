@@ -54,11 +54,6 @@ DEFAULT_LOWPASS_CHUNK_SIZE = 64
 DEFAULT_LOWPASS_KEEP = 32
 DEFAULT_LOWPASS_TARGET_FILTER = "mlp"
 LOWPASS_TARGET_FILTER_CHOICES = {"mlp", "all", "none"}
-# Eval-correctness version. Bump when a change alters absolute eval-loss
-# numbers (e.g. document-aware attention masking, eval-set tokenization
-# changes). Records under records/<track>/v<N>/ are only comparable within
-# the same version.
-EVAL_VERSION = "v2"
 
 DATA_MODE_CHOICES = {"sft", "cpt"}
 OPTIMIZER_CHOICES = {
@@ -286,8 +281,7 @@ def _write_local_record(summary: dict[str, Any], artifacts: dict[str, str]) -> P
         raise ValueError(f"record track must be one of: {', '.join(TRACKS.keys())}")
 
     record_name = f"{summary['record_date']}_{_slugify(str(summary['record_description']))}"
-    version = str(summary.get("eval_version", EVAL_VERSION))
-    record_dir = Path(TRACKS[track]["record_dir"]) / version / record_name
+    record_dir = Path(TRACKS[track]["record_dir"]) / record_name
     if record_dir.exists():
         record_dir = record_dir.with_name(f"{record_dir.name}_{summary['run_id']}")
     record_dir.mkdir(parents=True, exist_ok=False)
@@ -497,7 +491,6 @@ def run_track1(
     checkpointing_enabled = gradient_checkpointing != "false"
     gradient_checkpointing_fallback_used = False
     replaced_lowpass_modules: list[str] = []
-    pack_align = int(lowpass_chunk_size) if lowpass else 1
 
     os.environ.setdefault("HF_HOME", str(HF_CACHE))
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -660,8 +653,6 @@ def run_track1(
         "lowpass_target_filter": lowpass_target_filter,
         "lowpass_hadamard_backend": lowpass_hadamard_backend,
         "lowpass_replaced_modules": len(replaced_lowpass_modules),
-        "eval_version": EVAL_VERSION,
-        "pack_align": pack_align,
         "lr_schedule": lr_schedule,
         "lr_decay_fraction": lr_decay_fraction,
         "min_lr_ratio": min_lr_ratio,
@@ -780,24 +771,6 @@ def run_track1(
     def render_sft_row(row: dict[str, Any]) -> tuple[list[int], list[int]] | None:
         return _render_sft_row(row, tokenize_piece, seq_len)
 
-    # When lowpass is on, pad each document to a multiple of lowpass_chunk_size
-    # so that every Hadamard chunk is purely within one document. Pad labels are
-    # -100 (ignored in loss); pad position_ids continue the document's monotonic
-    # count, so doc-aware attention keeps them in the same attention block.
-    pad_token_id = int(tokenizer.pad_token_id)
-
-    def align_doc(row_ids: list[int], row_labels: list[int]) -> tuple[list[int], list[int]]:
-        if pack_align <= 1 or not row_ids:
-            return row_ids, row_labels
-        remainder = len(row_ids) % pack_align
-        if remainder == 0:
-            return row_ids, row_labels
-        pad_count = pack_align - remainder
-        return (
-            row_ids + [pad_token_id] * pad_count,
-            row_labels + [-100] * pad_count,
-        )
-
     def build_eval_cache() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Path, int]:
         if data_mode == "sft":
             return build_sft_eval_cache()
@@ -830,7 +803,6 @@ def run_track1(
             "seed": seed,
             "kind": "all_token_cpt_packed_v3_docaware",
             "text_field": cpt_text_field,
-            "pack_align": pack_align,
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
         eval_path = eval_dir / f"{key}.pt"
@@ -840,7 +812,6 @@ def run_track1(
 
         need_tokens = eval_blocks * seq_len
         token_buffer: list[int] = []
-        label_buffer: list[int] = []
         position_buffer: list[int] = []
         skip_docs = 0
         for row in dataset_stream(shuffle=False):
@@ -849,10 +820,8 @@ def run_track1(
                 skip_docs += 1
                 continue
             row_ids = tokenize_text(text)
-            padded_ids, padded_labels = align_doc(list(row_ids), list(row_ids))
-            token_buffer.extend(padded_ids)
-            label_buffer.extend(padded_labels)
-            position_buffer.extend(range(len(padded_ids)))
+            token_buffer.extend(row_ids)
+            position_buffer.extend(range(len(row_ids)))
             skip_docs += 1
             if len(token_buffer) >= need_tokens:
                 break
@@ -864,8 +833,8 @@ def run_track1(
 
         input_ids = torch.tensor(token_buffer[:need_tokens], dtype=torch.long).view(eval_blocks, seq_len)
         position_ids = torch.tensor(position_buffer[:need_tokens], dtype=torch.long).view(eval_blocks, seq_len)
-        labels = torch.tensor(label_buffer[:need_tokens], dtype=torch.long).view(eval_blocks, seq_len)
-        supervised_tokens = int((labels != -100).sum())
+        labels = input_ids.clone()
+        supervised_tokens = int(labels.numel())
         torch.save(
             {
                 "input_ids": input_ids,
@@ -892,7 +861,6 @@ def run_track1(
             "sequence_packing": DEFAULT_SEQUENCE_PACKING,
             "packing_strategy": DEFAULT_PACKING_STRATEGY,
             "kind": "chatml_assistant_only_sft_packed_v3_docaware",
-            "pack_align": pack_align,
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
         eval_path = eval_dir / f"{key}.pt"
@@ -928,10 +896,9 @@ def run_track1(
             if rendered is None:
                 continue
             row_ids, row_labels = rendered
-            padded_ids, padded_labels = align_doc(list(row_ids), list(row_labels))
-            token_buffer.extend(padded_ids)
-            label_buffer.extend(padded_labels)
-            position_buffer.extend(range(len(padded_ids)))
+            token_buffer.extend(row_ids)
+            label_buffer.extend(row_labels)
+            position_buffer.extend(range(len(row_ids)))
             drain_blocks()
             if len(input_blocks) >= eval_blocks:
                 break
@@ -1024,16 +991,17 @@ def run_track1(
                     if rendered is None:
                         continue
                     row_ids, row_labels = rendered
+                    token_buffer.extend(row_ids)
+                    label_buffer.extend(row_labels)
+                    position_buffer.extend(range(len(row_ids)))
                 else:
                     text = row.get(cpt_text_field)
                     if not isinstance(text, str) or not text.strip():
                         continue
                     row_ids = tokenize_text(text)
-                    row_labels = row_ids
-                padded_ids, padded_labels = align_doc(list(row_ids), list(row_labels))
-                token_buffer.extend(padded_ids)
-                label_buffer.extend(padded_labels)
-                position_buffer.extend(range(len(padded_ids)))
+                    token_buffer.extend(row_ids)
+                    label_buffer.extend(row_ids)
+                    position_buffer.extend(range(len(row_ids)))
 
                 while len(token_buffer) >= seq_len:
                     block_ids = token_buffer[:seq_len]
